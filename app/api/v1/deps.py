@@ -106,7 +106,7 @@ class Container:
     ocr_registry: dict[str, OcrProvider] = field(default_factory=dict)
 
     @classmethod
-    def build(cls, settings: Settings | None = None) -> "Container":
+    def build(cls, settings: Settings | None = None) -> Container:
         """Assemble the container from settings.
 
         Redis is optional at boot: when unreachable we fall back to the
@@ -178,9 +178,7 @@ class Container:
         await self.engine.dispose()
         await self.http_client.aclose()
         if self.redis is not None:
-            close = getattr(self.redis, "aclose", None) or getattr(self.redis, "close", None)
-            if close is not None:
-                await close()
+            await self.redis.aclose()
 
     async def create_tables(self) -> None:
         """Create all tables (development/test bootstrap convenience)."""
@@ -502,6 +500,7 @@ def get_assignment_service(
         comments=RubricCommentRepository(session),
         submissions=SubmissionRepository(session),
         attachments=AttachmentRepository(session),
+        tasks=BatchGradingTaskRepository(session),
         classrooms=ClassroomRepository(session),
         clock=container.clock,
     )
@@ -532,6 +531,7 @@ def get_assessment_service(
             comments=RubricCommentRepository(session),
             submissions=SubmissionRepository(session),
             attachments=AttachmentRepository(session),
+            tasks=BatchGradingTaskRepository(session),
             classrooms=ClassroomRepository(session),
             clock=container.clock,
         ),
@@ -564,28 +564,37 @@ def get_direct_grading_service(
     )
 
 
-def get_file_service(container: Container = ContainerDep) -> FileService:
+def get_file_service(
+    session: AsyncSession = SessionDep, container: Container = ContainerDep
+) -> FileService:
     """Build the file service.
 
     Args:
         container: App container.
+        session: Request-scoped persistence.
 
     Returns:
         Service instance.
     """
-    return FileService(container.storage)
+    return FileService(
+        container.storage, UserRepository(session), get_assignment_service(session, container)
+    )
 
 
-def get_school_service(session: AsyncSession = SessionDep) -> SchoolService:
+def get_school_service(
+    session: AsyncSession = SessionDep, container: Container = ContainerDep
+) -> SchoolService:
     """Build the school service for this request.
 
     Args:
         session: Request session.
+        container: Storage configuration and adapters.
 
     Returns:
         Service instance.
     """
     return SchoolService(
+        storage=container.storage,
         schools=SchoolRepository(session),
         configs=SchoolConfigRepository(session),
     )

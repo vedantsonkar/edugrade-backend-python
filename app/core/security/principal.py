@@ -38,7 +38,7 @@ class UserPrincipal:
     enable_logging: bool = False
 
     @classmethod
-    def from_claims(cls, claims: dict[str, object]) -> "UserPrincipal":
+    def from_claims(cls, claims: dict[str, object]) -> UserPrincipal:
         """Build a principal from verified access-token claims.
 
         Args:
@@ -58,9 +58,7 @@ class UserPrincipal:
             name=str(claims.get("name", "")),
             role=str(claims["role"]),
             school_id=str(claims["schoolId"]) if "schoolId" in claims else None,
-            school_name=(
-                str(claims["schoolName"]) if "schoolName" in claims else None
-            ),
+            school_name=(str(claims["schoolName"]) if "schoolName" in claims else None),
             school_subdomain=(
                 str(claims["schoolSubdomain"]) if "schoolSubdomain" in claims else None
             ),

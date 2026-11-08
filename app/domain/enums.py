@@ -40,6 +40,7 @@ class AssignmentState(StrEnum):
 
     UPCOMING = "upcoming"
     ONGOING = "ongoing"
+    DUE_SOON = "due_soon"
     OVERDUE = "overdue"
     SUBMITTED = "submitted"
     GRADED = "graded"

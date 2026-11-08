@@ -7,15 +7,17 @@ so every call is wrapped in ``asyncio.to_thread`` to keep the event loop free
 
 import asyncio
 import logging
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import boto3
-from botocore.client import BaseClient as BotoClient
 from botocore.exceptions import BotoCoreError, ClientError
+
+if TYPE_CHECKING:
+    from types_boto3_s3 import S3Client
 
 from app.core.config import Settings
 from app.core.errors import AppError, NotFoundError, StorageError
-from app.core.storage.base import PresignedDownload, PresignedUpload
+from app.core.storage.base import PresignedDownload, PresignedUpload, StoredObjectInfo
 
 logger = logging.getLogger(__name__)
 
@@ -38,13 +40,23 @@ class SeaweedS3Storage:
         self._presign_expire = settings.seaweed_s3_presign_expire_seconds
         from botocore.config import Config
 
-        self._client: BotoClient = boto3.client(
+        self._client: S3Client = boto3.client(
             "s3",
             endpoint_url=settings.seaweed_s3_endpoint,
             aws_access_key_id=settings.seaweed_s3_access_key_id,
             aws_secret_access_key=settings.seaweed_s3_secret_access_key,
             region_name=settings.seaweed_s3_region,
             config=Config(connect_timeout=3, read_timeout=5, retries={"max_attempts": 1}),
+        )
+
+        # Sign against the browser-facing origin without rewriting signed URLs.
+        self._signer: S3Client = boto3.client(
+            "s3",
+            endpoint_url=settings.seaweed_s3_public_endpoint or settings.seaweed_s3_endpoint,
+            aws_access_key_id=settings.seaweed_s3_access_key_id,
+            aws_secret_access_key=settings.seaweed_s3_secret_access_key,
+            region_name=settings.seaweed_s3_region,
+            config=Config(signature_version="s3v4", s3={"addressing_style": "path"}),
         )
 
     def _translate(self, key: str, exc: Exception) -> AppError:
@@ -82,7 +94,7 @@ class SeaweedS3Storage:
             params["ContentType"] = content_type
         try:
             url: str = await asyncio.to_thread(
-                self._client.generate_presigned_url,
+                self._signer.generate_presigned_url,
                 "put_object",
                 Params=params,
                 ExpiresIn=self._presign_expire,
@@ -105,7 +117,7 @@ class SeaweedS3Storage:
         """
         try:
             url: str = await asyncio.to_thread(
-                self._client.generate_presigned_url,
+                self._signer.generate_presigned_url,
                 "get_object",
                 Params={"Bucket": self._bucket, "Key": key},
                 ExpiresIn=self._presign_expire,
@@ -129,9 +141,7 @@ class SeaweedS3Storage:
         """
 
         def _read() -> bytes:
-            response: dict[str, Any] = self._client.get_object(
-                Bucket=self._bucket, Key=key
-            )
+            response = self._client.get_object(Bucket=self._bucket, Key=key)
             body = response["Body"]
             return bytes(body.read())
 
@@ -172,11 +182,32 @@ class SeaweedS3Storage:
             StorageError: On backend failure.
         """
         try:
-            await asyncio.to_thread(
-                self._client.delete_object, Bucket=self._bucket, Key=key
-            )
+            await asyncio.to_thread(self._client.delete_object, Bucket=self._bucket, Key=key)
         except (ClientError, BotoCoreError) as exc:
             raise self._translate(key, exc) from exc
+
+    async def list_objects(self, prefix: str) -> list[StoredObjectInfo]:
+        """List complete object metadata across all storage pages."""
+
+        def collect() -> list[StoredObjectInfo]:
+            rows: list[StoredObjectInfo] = []
+            for page in self._client.get_paginator("list_objects_v2").paginate(
+                Bucket=self._bucket, Prefix=prefix
+            ):
+                rows.extend(
+                    StoredObjectInfo(
+                        key=entry["Key"],
+                        size=entry.get("Size", 0),
+                        last_modified=entry.get("LastModified"),
+                    )
+                    for entry in page.get("Contents", [])
+                )
+            return rows
+
+        try:
+            return await asyncio.to_thread(collect)
+        except (ClientError, BotoCoreError) as exc:
+            raise self._translate(prefix, exc) from exc
 
     async def list_keys(self, prefix: str) -> list[str]:
         """List keys under a prefix.
@@ -203,6 +234,20 @@ class SeaweedS3Storage:
             return await asyncio.to_thread(_list)
         except (ClientError, BotoCoreError) as exc:
             raise self._translate(prefix, exc) from exc
+
+    async def initialize_bucket(self) -> None:
+        """Create the development bucket; gateway flags own CORS on SeaweedFS 3.80."""
+
+        def initialize() -> None:
+            try:
+                self._client.head_bucket(Bucket=self._bucket)
+            except ClientError as exc:
+                code = exc.response.get("Error", {}).get("Code", "")
+                if code not in {"404", "NoSuchBucket", "NotFound"}:
+                    raise
+                self._client.create_bucket(Bucket=self._bucket)
+
+        await asyncio.to_thread(initialize)
 
     async def check(self) -> None:
         """Verify backend reachability for the readiness probe.

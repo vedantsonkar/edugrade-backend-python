@@ -6,6 +6,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, Response
 
 from app.api.v1.deps import (
+    get_assessment_service,
     get_assignment_service,
     get_batch_task_repo,
     get_submission_repo,
@@ -14,9 +15,8 @@ from app.core.errors import ForbiddenError
 from app.core.pagination import Page, PageParams, page_params
 from app.core.ratelimit.dependency import rate_limit
 from app.core.security.guards import CurrentUser, StaffUser
-from app.domain.enums import BatchGradingMode, BatchGradingTrigger
-from app.domain.grading import BatchGradingTask
-from app.repositories.grading import BatchGradingTaskRepository, SubmissionRepository
+from app.repositories.grading import SubmissionRepository
+from app.schemas.assessments import AttemptResponse
 from app.schemas.assignments import (
     AssignmentCreate,
     AssignmentResponse,
@@ -33,6 +33,7 @@ from app.schemas.assignments import (
     SubmissionResponse,
 )
 from app.schemas.grading import BatchGradingTaskResponse, GradeAllRequest
+from app.services.assessments import AssessmentService
 from app.services.assignments import AssignmentService
 from app.services.audit import AuditService as _UnusedAudit  # noqa: F401
 from app.services.files import FileService as _UnusedFiles  # noqa: F401
@@ -92,7 +93,7 @@ async def list_assignments(
         current_user, params, q=q, state=state, class_ids=class_ids
     )
     return Page[AssignmentResponse](
-        items=[AssignmentResponse.model_validate(a) for a in page.items],
+        items=[service.present(a, current_user) for a in page.items],
         page=page.page,
         page_size=page.page_size,
         total=page.total,
@@ -149,7 +150,7 @@ async def get_assignment(
         NotFoundError: When absent or invisible to the caller.
     """
     assignment = await service.get_assignment(current_user, assignment_id)
-    return AssignmentResponse.model_validate(assignment)
+    return service.present(assignment, current_user)
 
 
 @router.patch(
@@ -188,7 +189,7 @@ async def update_assignment(
 )
 async def list_submissions(
     assignment_id: UUID,
-    current_user: StaffUser,
+    current_user: CurrentUser,
     service: Annotated[AssignmentService, Depends(get_assignment_service)],
     params: Annotated[PageParams, Depends(page_params)],
     onlyUngraded: bool = False,
@@ -274,9 +275,7 @@ async def override_grade(
     Returns:
         The updated submission.
     """
-    submission = await service.override_grade(
-        current_user, assignment_id, submission_id, payload
-    )
+    submission = await service.override_grade(current_user, assignment_id, submission_id, payload)
     return SubmissionResponse.model_validate(submission)
 
 
@@ -305,19 +304,8 @@ async def grade_all(
     Returns:
         The created task's state.
     """
-    await service.get_assignment(current_user, assignment_id)
-    if current_user.role == "STUDENT":
-        raise ForbiddenError("Teacher or administrator role required.")
-    mode = BatchGradingMode(payload.mode if payload else "UNGRADED_ONLY")
-    task_repo: BatchGradingTaskRepository = tasks  # type: ignore[assignment]
-    task = await task_repo.add(
-        BatchGradingTask(
-            assignment_id=str(assignment_id),
-            school_id=_school(current_user),
-            trigger=BatchGradingTrigger.MANUAL,
-            mode=mode,
-            created_by_id=str(current_user.id),
-        )
+    task = await service.queue_grading(
+        current_user, assignment_id, payload.mode if payload else "UNGRADED_ONLY"
     )
     return BatchGradingTaskResponse.model_validate(task)
 
@@ -373,67 +361,9 @@ async def create_questions(
     Returns:
         The created questions.
     """
-    payloads = (
-        payload.questions if isinstance(payload, QuestionsCreateRequest) else [payload]
-    )
+    payloads = payload.questions if isinstance(payload, QuestionsCreateRequest) else [payload]
     created = await service.create_questions(current_user, assignment_id, payloads)
     return [QuestionResponse.model_validate(q) for q in created]
-
-
-@router.patch(
-    "/{assignment_id}/questions/{question_id}",
-    response_model=QuestionResponse,
-    summary="Update question (staff)",
-)
-async def update_question(
-    assignment_id: UUID,
-    question_id: UUID,
-    payload: QuestionUpdate,
-    current_user: StaffUser,
-    service: Annotated[AssignmentService, Depends(get_assignment_service)],
-) -> QuestionResponse:
-    """Update a question (options replaced when provided).
-
-    Args:
-        assignment_id: Assignment id.
-        question_id: Question id.
-        payload: Patch payload.
-        current_user: Authenticated staff principal.
-        service: Assignment service.
-
-    Returns:
-        The updated question.
-    """
-    question = await service.update_question(
-        current_user, assignment_id, question_id, payload
-    )
-    return QuestionResponse.model_validate(question)
-
-
-@router.delete(
-    "/{assignment_id}/questions/{question_id}",
-    status_code=204,
-    summary="Delete question (staff)",
-)
-async def delete_question(
-    assignment_id: UUID,
-    question_id: UUID,
-    current_user: StaffUser,
-    service: Annotated[AssignmentService, Depends(get_assignment_service)],
-) -> Response:
-    """Delete a question and its options.
-
-    Args:
-        assignment_id: Assignment id.
-        question_id: Question id.
-        current_user: Authenticated staff principal.
-        service: Assignment service.
-
-    Returns:
-        Empty 204 response.
-    """
-    await service.delete_question(current_user, assignment_id, question_id)
-    return Response(status_code=204)
 
 
 @router.patch(
@@ -461,13 +391,65 @@ async def reorder_questions(
     Raises:
         ValidationFailedError: When the id set does not match.
     """
-    await service.reorder_questions(
-        current_user, assignment_id, payload.question_ids
-    )
+    await service.reorder_questions(current_user, assignment_id, payload.question_ids)
     return Response(status_code=204)
 
 
 # ── Rubric comments ──────────────────────────────────────────────────────────
+
+
+@router.patch(
+    "/{assignment_id}/questions/{question_id}",
+    response_model=QuestionResponse,
+    summary="Update question (staff)",
+)
+async def update_question(
+    assignment_id: UUID,
+    question_id: UUID,
+    payload: QuestionUpdate,
+    current_user: StaffUser,
+    service: Annotated[AssignmentService, Depends(get_assignment_service)],
+) -> QuestionResponse:
+    """Update a question (options replaced when provided).
+
+    Args:
+        assignment_id: Assignment id.
+        question_id: Question id.
+        payload: Patch payload.
+        current_user: Authenticated staff principal.
+        service: Assignment service.
+
+    Returns:
+        The updated question.
+    """
+    question = await service.update_question(current_user, assignment_id, question_id, payload)
+    return QuestionResponse.model_validate(question)
+
+
+@router.delete(
+    "/{assignment_id}/questions/{question_id}",
+    status_code=204,
+    summary="Delete question (staff)",
+)
+async def delete_question(
+    assignment_id: UUID,
+    question_id: UUID,
+    current_user: StaffUser,
+    service: Annotated[AssignmentService, Depends(get_assignment_service)],
+) -> Response:
+    """Delete a question and its options.
+
+    Args:
+        assignment_id: Assignment id.
+        question_id: Question id.
+        current_user: Authenticated staff principal.
+        service: Assignment service.
+
+    Returns:
+        Empty 204 response.
+    """
+    await service.delete_question(current_user, assignment_id, question_id)
+    return Response(status_code=204)
 
 
 @router.get(
@@ -518,3 +500,30 @@ async def add_comment(
     """
     comment = await service.add_comment(current_user, assignment_id, payload.comment)
     return RubricCommentResponse.model_validate(comment)
+
+
+@router.get("/{assignment_id}/grading-task", response_model=BatchGradingTaskResponse | None)
+async def latest_grading_task(
+    assignment_id: UUID,
+    current_user: StaffUser,
+    service: Annotated[AssignmentService, Depends(get_assignment_service)],
+) -> BatchGradingTaskResponse | None:
+    """Read current or completed batch progress for a visible assignment."""
+    task = await service.latest_grading(current_user, assignment_id)
+    return BatchGradingTaskResponse.model_validate(task) if task else None
+
+
+@router.get("/{assignment_id}/attempts", response_model=Page[AttemptResponse])
+async def list_assignment_attempts(
+    assignment_id: UUID,
+    current_user: CurrentUser,
+    service: Annotated[AssessmentService, Depends(get_assessment_service)],
+    params: Annotated[PageParams, Depends(page_params)],
+) -> Page[AttemptResponse]:
+    """List answer-free attempt progress for visible assignment results."""
+    page = await service.list_attempts(current_user, assignment_id, params)
+    return Page.of(
+        [service.present_attempt(a, current_user) for a in page.items],
+        page.total,
+        params,
+    )

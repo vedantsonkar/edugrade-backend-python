@@ -129,7 +129,7 @@ class GoogleOAuthService:
             return OAuthCallbackResult(login=None, error="Missing OAuth parameters.")
         try:
             school = await self._resolve_school_from_state(state)
-        except (jwt.InvalidTokenError, KeyError, ValueError) as exc:
+        except (jwt.InvalidTokenError, KeyError, ValueError, NotFoundError) as exc:
             logger.info("OAuth state rejected: %s", exc)
             return OAuthCallbackResult(login=None, error="Invalid OAuth state.")
 
@@ -139,19 +139,15 @@ class GoogleOAuthService:
             return OAuthCallbackResult(login=None, error=str(exc.message))
 
         email = str(userinfo.get("email", "")).lower()
-        if not userinfo.get("email_verified", False) and not email:
+        if not userinfo.get("email_verified", False) or not email:
             return OAuthCallbackResult(login=None, error="Google account email unavailable.")
 
         user = await self._users.get_by_email(email)
         if user is None:
-            if school is None:
-                return OAuthCallbackResult(
-                    login=None, error="Sign in from your school's login page."
-                )
-            user = await self._create_sso_user(
-                email=email,
-                name=str(userinfo.get("name") or email.split("@", 1)[0]),
-                school=school,
+            return OAuthCallbackResult(login=None, error="This account is not registered.")
+        if school is None or str(user.school_id) != str(school.id):
+            return OAuthCallbackResult(
+                login=None, error="Account does not belong to the selected school."
             )
         error = self._sso_rejection(user)
         if error is not None:
@@ -168,7 +164,7 @@ class GoogleOAuthService:
         return OAuthCallbackResult(login=result)
 
     async def _finalize_login(
-        self, user: User, school: "School", enable_logging: bool
+        self, user: User, school: School, enable_logging: bool
     ) -> LoginResult:
         """Issue tokens for an SSO-validated user via the auth service.
 
@@ -197,9 +193,7 @@ class GoogleOAuthService:
         access = self._tokens.create_access_token(principal)
         refresh = self._tokens.create_refresh_token(UUID(str(user.id)))
         await self._refresh_tokens.add(
-            RefreshToken(
-                jti=refresh.jti, user_id=str(user.id), expires_at=refresh.expires_at
-            )
+            RefreshToken(jti=refresh.jti, user_id=str(user.id), expires_at=refresh.expires_at)
         )
         return LoginResult(
             user=user,
@@ -226,7 +220,7 @@ class GoogleOAuthService:
         }
         return jwt.encode(payload, self._settings.jwt_secret, algorithm="HS256")
 
-    async def _resolve_school_from_state(self, state: str) -> "School | None":
+    async def _resolve_school_from_state(self, state: str) -> School | None:
         """Verify the state token and resolve the referenced school.
 
         Args:
@@ -240,8 +234,11 @@ class GoogleOAuthService:
             NotFoundError: When the referenced school does not exist.
         """
         payload: dict[str, Any] = jwt.decode(
-            state, self._settings.jwt_secret, algorithms=["HS256"]
+            state, self._settings.jwt_secret, algorithms=["HS256"], options={"verify_exp": False}
         )
+        expiry = payload.get("exp")
+        if not isinstance(expiry, (int, float)) or expiry <= self._clock.now().timestamp():
+            raise jwt.ExpiredSignatureError("OAuth state expired.")
         subdomain = payload.get("school")
         if not subdomain:
             return None
@@ -285,9 +282,7 @@ class GoogleOAuthService:
             logger.warning("Google code exchange failed: %s", exc)
             raise ExternalServiceError("Google sign-in failed. Please try again.") from exc
 
-    async def _create_sso_user(
-        self, *, email: str, name: str, school: "School"
-    ) -> User:
+    async def _create_sso_user(self, *, email: str, name: str, school: School) -> User:
         """Create a new SSO user in the resolved school.
 
         Args:

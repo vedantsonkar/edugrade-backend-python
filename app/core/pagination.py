@@ -6,13 +6,10 @@ assignments, audit logs, …) MUST paginate via :class:`PageParams` and
 """
 
 import math
-from typing import Generic, TypeVar
 
 from fastapi import Query
 from pydantic import BaseModel, ConfigDict
 from pydantic.alias_generators import to_camel
-
-ItemT = TypeVar("ItemT")
 
 DEFAULT_PAGE_SIZE = 20
 MAX_PAGE_SIZE = 100
@@ -59,7 +56,7 @@ async def page_params(
     return PageParams(page=page, page_size=page_size)
 
 
-class Page(BaseModel, Generic[ItemT]):
+class Page[ItemT](BaseModel):
     """Paginated result envelope returned by every list endpoint.
 
     Attributes:
@@ -84,7 +81,7 @@ class Page(BaseModel, Generic[ItemT]):
         items: list[ItemT],
         total: int,
         params: PageParams,
-    ) -> "Page[ItemT]":
+    ) -> Page[ItemT]:
         """Build a page envelope from raw query results.
 
         Args:

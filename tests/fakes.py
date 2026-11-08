@@ -15,7 +15,7 @@ from app.core.security.tokens import (
     REFRESH_TOKEN_TYPE,
     RefreshTokenIssuance,
 )
-from app.core.storage.base import PresignedDownload, PresignedUpload
+from app.core.storage.base import PresignedDownload, PresignedUpload, StoredObjectInfo
 
 
 class FakeClock:
@@ -93,8 +93,12 @@ class FakeTokenService:
         from datetime import UTC, datetime
 
         jti = Uuid7Provider().new_id()
-        payload = {"sub": str(user_id), "typ": REFRESH_TOKEN_TYPE, "jti": str(jti),
-                   "exp": self._clock._current + self._refresh_ttl}
+        payload = {
+            "sub": str(user_id),
+            "typ": REFRESH_TOKEN_TYPE,
+            "jti": str(jti),
+            "exp": self._clock._current + self._refresh_ttl,
+        }
         token = "fake-refresh." + base64.b64encode(json.dumps(payload).encode()).decode()
         return RefreshTokenIssuance(
             token=token,
@@ -158,11 +162,16 @@ class MemoryRateLimiterStub:
         self._counters[key] = (epoch, hits)
         if hits > limit:
             return RateLimitResult(
-                allowed=False, limit=limit, remaining=0,
-                reset_after=window_seconds, retry_after=window_seconds,
+                allowed=False,
+                limit=limit,
+                remaining=0,
+                reset_after=window_seconds,
+                retry_after=window_seconds,
             )
         return RateLimitResult(
-            allowed=True, limit=limit, remaining=max(0, limit - hits),
+            allowed=True,
+            limit=limit,
+            remaining=max(0, limit - hits),
             reset_after=window_seconds,
         )
 
@@ -240,6 +249,13 @@ class InMemoryStorage:
             key: Key to delete.
         """
         self.objects.pop(key, None)
+
+    async def list_objects(self, prefix: str) -> list[StoredObjectInfo]:
+        """Return fake metadata using the same prefix contract as S3."""
+        return [
+            StoredObjectInfo(key=key, size=len(self.objects[key].data), last_modified=None)
+            for key in await self.list_keys(prefix)
+        ]
 
     async def list_keys(self, prefix: str) -> list[str]:
         """List keys under a prefix.

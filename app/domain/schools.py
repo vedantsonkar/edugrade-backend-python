@@ -50,14 +50,12 @@ class School(UUID7PKMixin, TimestampMixin, Base):
     default_locale: Mapped[str] = mapped_column(String(10), default="en")
     timezone: Mapped[str] = mapped_column(String(64), default="Asia/Kolkata")
 
-    config: Mapped["SchoolConfig"] = relationship(
+    config: Mapped[SchoolConfig] = relationship(
         back_populates="school", uselist=False, lazy="selectin"
     )
-    users: Mapped[list["User"]] = relationship(back_populates="school")
-    classrooms: Mapped[list["Classroom"]] = relationship(back_populates="school")
-    batch_tasks: Mapped[list["BatchGradingTask"]] = relationship(
-        back_populates="school"
-    )
+    users: Mapped[list[User]] = relationship(back_populates="school")
+    classrooms: Mapped[list[Classroom]] = relationship(back_populates="school")
+    batch_tasks: Mapped[list[BatchGradingTask]] = relationship(back_populates="school")
 
 
 class SchoolConfig(UUID7PKMixin, TimestampMixin, Base):
@@ -73,24 +71,17 @@ class SchoolConfig(UUID7PKMixin, TimestampMixin, Base):
     """
 
     __tablename__ = "school_configs"
-    __table_args__ = (
-        UniqueConstraint("school_id", name="uq_school_configs_school_id"),
-    )
+    __table_args__ = (UniqueConstraint("school_id", name="uq_school_configs_school_id"),)
 
     school_id: Mapped[str] = mapped_column(
-        UUID_KEY,
-        ForeignKey("schools.id", ondelete="CASCADE"), index=True
+        UUID_KEY, ForeignKey("schools.id", ondelete="CASCADE"), index=True
     )
-    allow_multiple_class_teachers: Mapped[bool] = mapped_column(
-        Boolean, default=False
-    )
+    allow_multiple_class_teachers: Mapped[bool] = mapped_column(Boolean, default=False)
     enable_logging: Mapped[bool] = mapped_column(Boolean, default=False)
     enable_vision_ocr: Mapped[bool] = mapped_column(Boolean, default=True)
-    current_academic_year: Mapped[str] = mapped_column(
-        String(16), default="2025-2026"
-    )
+    current_academic_year: Mapped[str] = mapped_column(String(16), default="2025-2026")
 
-    school: Mapped["School"] = relationship(back_populates="config")
+    school: Mapped[School] = relationship(back_populates="config")
 
 
 def task_status_values() -> list[str]:

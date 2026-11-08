@@ -50,50 +50,37 @@ class User(UUID7PKMixin, TimestampMixin, Base):
     role: Mapped[UserRole] = mapped_column(default=UserRole.STUDENT, index=True)
     avatar_url: Mapped[str | None] = mapped_column(String(512))
     school_id: Mapped[str] = mapped_column(
-        UUID_KEY,
-        ForeignKey("schools.id", ondelete="CASCADE"), index=True
+        UUID_KEY, ForeignKey("schools.id", ondelete="CASCADE"), index=True
     )
     grade_id: Mapped[str | None] = mapped_column(
-        UUID_KEY,
-        ForeignKey("grades.id", ondelete="SET NULL"), index=True
+        UUID_KEY, ForeignKey("grades.id", ondelete="SET NULL"), index=True
     )
     division_id: Mapped[str | None] = mapped_column(
-        UUID_KEY,
-        ForeignKey("divisions.id", ondelete="SET NULL"), index=True
+        UUID_KEY, ForeignKey("divisions.id", ondelete="SET NULL"), index=True
     )
     roll_number: Mapped[str | None] = mapped_column(String(64))
     student_identifier: Mapped[str | None] = mapped_column(String(64))
     date_of_birth: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     password_hash: Mapped[str | None] = mapped_column(String(255))
-    auth_method: Mapped[AuthMethod] = mapped_column(
-        default=AuthMethod.SSO_GOOGLE, index=True
-    )
+    auth_method: Mapped[AuthMethod] = mapped_column(default=AuthMethod.SSO_GOOGLE, index=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
     last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     phone_country_code: Mapped[str | None] = mapped_column(String(8), default="+91")
     phone_number: Mapped[str | None] = mapped_column(String(15), index=True)
     preferred_locale: Mapped[str | None] = mapped_column(String(10))
 
-    school: Mapped["School"] = relationship(back_populates="users", lazy="selectin")
-    grade: Mapped["Grade | None"] = relationship(lazy="selectin")
-    division: Mapped["Division | None"] = relationship(lazy="selectin")
-    classes_taught: Mapped[list["Classroom"]] = relationship(
-        back_populates="class_teacher"
+    school: Mapped[School] = relationship(back_populates="users", lazy="selectin")
+    grade: Mapped[Grade | None] = relationship(lazy="selectin")
+    division: Mapped[Division | None] = relationship(lazy="selectin")
+    classes_taught: Mapped[list[Classroom]] = relationship(
+        back_populates="class_teacher", lazy="selectin"
     )
-    assignments_created: Mapped[list["Assignment"]] = relationship(
-        back_populates="teacher"
-    )
-    submissions: Mapped[list["Submission"]] = relationship(back_populates="student")
-    attempts: Mapped[list["AssessmentAttempt"]] = relationship(
-        back_populates="student"
-    )
-    rubric_comments: Mapped[list["RubricComment"]] = relationship(
-        back_populates="author"
-    )
-    batch_tasks_created: Mapped[list["BatchGradingTask"]] = relationship(
-        back_populates="created_by"
-    )
-    refresh_tokens: Mapped[list["RefreshToken"]] = relationship(
+    assignments_created: Mapped[list[Assignment]] = relationship(back_populates="teacher")
+    submissions: Mapped[list[Submission]] = relationship(back_populates="student")
+    attempts: Mapped[list[AssessmentAttempt]] = relationship(back_populates="student")
+    rubric_comments: Mapped[list[RubricComment]] = relationship(back_populates="author")
+    batch_tasks_created: Mapped[list[BatchGradingTask]] = relationship(back_populates="created_by")
+    refresh_tokens: Mapped[list[RefreshToken]] = relationship(
         back_populates="user", cascade="all, delete-orphan"
     )
 
@@ -124,20 +111,17 @@ class RefreshToken(UUID7PKMixin, Base):
     """
 
     __tablename__ = "refresh_tokens"
-    __table_args__ = (
-        UniqueConstraint("jti", name="uq_refresh_tokens_jti"),
-    )
+    __table_args__ = (UniqueConstraint("jti", name="uq_refresh_tokens_jti"),)
 
     jti: Mapped[UUID] = mapped_column(UUID_KEY, index=True)
     user_id: Mapped[str] = mapped_column(
-        UUID_KEY,
-        ForeignKey("users.id", ondelete="CASCADE"), index=True
+        UUID_KEY, ForeignKey("users.id", ondelete="CASCADE"), index=True
     )
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     replaced_by_id: Mapped[UUID | None] = mapped_column(UUID_KEY)
 
-    user: Mapped["User"] = relationship(back_populates="refresh_tokens")
+    user: Mapped[User] = relationship(back_populates="refresh_tokens")
 
     @property
     def is_live(self) -> bool:

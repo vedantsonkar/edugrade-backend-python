@@ -87,7 +87,11 @@ class BatchGradingProcessor:
             assignments = AssignmentRepository(session)
             tasks = BatchGradingTaskRepository(session)
             due = await assignments.find_due_for_auto_grading(now)
+            queued = 0
             for assignment in due:
+                await tasks.lock_assignment(assignment.id)
+                if await tasks.active_for_assignment(str(assignment.id)) is not None:
+                    continue
                 assignment.auto_graded_at = now
                 await tasks.add(
                     BatchGradingTask(
@@ -97,7 +101,8 @@ class BatchGradingProcessor:
                         mode=BatchGradingMode.UNGRADED_ONLY,
                     )
                 )
-            return len(due)
+                queued += 1
+            return queued
 
     async def start_queued_grading_tasks(self) -> int:
         """Launch QUEUED tasks: compile payloads and create Gemini jobs.
@@ -230,9 +235,7 @@ class BatchGradingProcessor:
             try:
                 data = await self._storage.get_bytes(attachment.url)
             except Exception:
-                logger.warning(
-                    "Skipping unreadable attachment %s", attachment.url, exc_info=True
-                )
+                logger.warning("Skipping unreadable attachment %s", attachment.url, exc_info=True)
                 continue
             mime = attachment.type or guess_mime(attachment.name)
             ocr = await self._ocr.extract_text(data, mime)
@@ -314,9 +317,7 @@ class BatchGradingProcessor:
         task.failed_submissions = failed
         task.processed_submissions = graded + failed
         task.status = (
-            BatchGradingTaskStatus.COMPLETED
-            if failed == 0
-            else BatchGradingTaskStatus.PARTIAL
+            BatchGradingTaskStatus.COMPLETED if failed == 0 else BatchGradingTaskStatus.PARTIAL
         )
         task.completed_at = self._clock.now()
 

@@ -4,22 +4,32 @@ Keys are produced by :mod:`app.core.storage.keys` and every client-supplied
 key passes :func:`ensure_key_accessible` before a read grant is issued.
 """
 
-from app.core.errors import ForbiddenError
+from uuid import UUID
+
+from app.core.errors import ForbiddenError, NotFoundError, ValidationFailedError
 from app.core.security.principal import UserPrincipal
 from app.core.storage.base import ObjectStorage
 from app.core.storage.keys import ensure_key_accessible, upload_key
+from app.repositories.users import UserRepository
+from app.services.assignments import AssignmentService
 
 
 class FileService:
     """Grants clients direct access to object storage within their scope."""
 
-    def __init__(self, storage: ObjectStorage) -> None:
+    def __init__(
+        self, storage: ObjectStorage, users: UserRepository, assignments: AssignmentService
+    ) -> None:
         """Inject the storage port.
 
         Args:
             storage: Object storage implementation.
+            users: Tenant-aware avatar ownership lookup.
+            assignments: Assignment visibility for snapshot reads.
         """
         self._storage = storage
+        self._users = users
+        self._assignments = assignments
 
     async def create_upload_grant(
         self, principal: UserPrincipal, *, filename: str, content_type: str | None
@@ -61,6 +71,16 @@ class FileService:
             ForbiddenError: When the key is outside the caller's scope.
         """
         ensure_key_accessible(key, principal)
+        parts = key.split("/")
+        try:
+            if parts[0] == "avatars":
+                owner = await self._users.get(UUID(parts[1]))
+                if owner is None or str(owner.school_id) != principal.school_id:
+                    raise NotFoundError("Avatar not found.")
+            elif parts[0] == "snapshots":
+                await self._assignments.get_assignment(principal, UUID(parts[1]))
+        except (ValueError, IndexError) as exc:
+            raise ValidationFailedError("Invalid storage key.") from exc
         grant = await self._storage.presign_get(key)
         return grant.key, grant.url, grant.expires_in
 

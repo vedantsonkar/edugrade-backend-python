@@ -53,7 +53,7 @@ class Settings(BaseSettings):
     google_client_id: str | None = Field(default=None)
     google_client_secret: str | None = Field(default=None)
     google_oauth_redirect_uri: str = Field(
-        default="http://localhost:8000/api/v1/auth/google/callback",
+        default="http://localhost:3000/api/v1/auth/google/callback",
     )
 
     # ── AI grading ───────────────────────────────────────────────────────
@@ -67,6 +67,7 @@ class Settings(BaseSettings):
 
     # ── Object storage (SeaweedFS S3 gateway) ────────────────────────────
     seaweed_s3_endpoint: str = Field(default="http://localhost:8333")
+    seaweed_s3_public_endpoint: str | None = Field(default=None)
     seaweed_s3_access_key_id: str = Field(default="admin")
     seaweed_s3_secret_access_key: str = Field(default="seaweedfs")
     seaweed_s3_bucket: str = Field(default="edugrade-files")

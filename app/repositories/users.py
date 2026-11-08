@@ -27,7 +27,7 @@ class UserRepository(BaseRepository[User]):
         stmt = select(User).where(func.lower(User.email) == email.lower())
         return (await self.session.execute(stmt)).scalar_one_or_none()
 
-    async def scoped(self, school_id: str, role: UserRole | None = None) -> Select[tuple[User]]:
+    async def scoped(self, school_id: str, role: UserRole | None = None) -> Select[User]:
         """Build a school-scoped user select, optionally by role.
 
         Args:
@@ -41,6 +41,16 @@ class UserRepository(BaseRepository[User]):
         if role is not None:
             stmt = stmt.where(User.role == role)
         return stmt.order_by(User.name)
+
+    async def activation_counts(self, school_id: str, role: UserRole) -> tuple[int, int]:
+        """Count active and inactive accounts of a school-scoped role."""
+        stmt = (
+            select(User.is_active, func.count())
+            .where(User.school_id == school_id, User.role == role)
+            .group_by(User.is_active)
+        )
+        counts = dict((await self.session.execute(stmt)).all())
+        return int(counts.get(True, 0)), int(counts.get(False, 0))
 
     async def count_active(self, school_id: str, role: UserRole) -> int:
         """Count active users of a role in a school.
@@ -144,8 +154,6 @@ class RefreshTokenRepository(BaseRepository[RefreshToken]):
 
         result = cast(
             "CursorResult[Any]",
-            await self.session.execute(
-                delete(RefreshToken).where(RefreshToken.user_id == user_id)
-            ),
+            await self.session.execute(delete(RefreshToken).where(RefreshToken.user_id == user_id)),
         )
         return int(result.rowcount or 0)

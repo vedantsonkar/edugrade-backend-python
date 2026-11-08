@@ -121,7 +121,7 @@ async def status(
         started_at=attempt.started_at,
         submitted_at=attempt.submitted_at,
         tab_switch_count=attempt.tab_switch_count,
-        score=attempt.score,
+        score=attempt.effective_score if assignment.show_results_after else None,
         max_score=attempt.max_score,
         remaining_seconds=remaining,
         max_score_total=total_points,
@@ -250,8 +250,8 @@ async def submit(
     """
     result = await service.submit(current_user, assignment_id)
     return SubmitResponse(
-        attempt=AttemptResponse.model_validate(result.attempt),
-        score=result.score,
+        attempt=service.present_attempt(result.attempt, current_user),
+        score=result.score if result.attempt.assignment.show_results_after else None,
         max_score=result.max_score,
-        percentage=result.percentage,
+        percentage=result.percentage if result.attempt.assignment.show_results_after else None,
     )

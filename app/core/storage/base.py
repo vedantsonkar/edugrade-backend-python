@@ -6,6 +6,7 @@ are async; implementations must not block the event loop.
 """
 
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Protocol, runtime_checkable
 
 
@@ -37,6 +38,15 @@ class PresignedDownload:
     key: str
     url: str
     expires_in: int
+
+
+@dataclass(frozen=True)
+class StoredObjectInfo:
+    """Metadata returned by the object-store listing port."""
+
+    key: str
+    size: int
+    last_modified: datetime | None
 
 
 @runtime_checkable
@@ -99,6 +109,10 @@ class ObjectStorage(Protocol):
         Args:
             key: Storage key to delete.
         """
+        ...
+
+    async def list_objects(self, prefix: str) -> list[StoredObjectInfo]:
+        """List object metadata beneath a scope-checked prefix."""
         ...
 
     async def list_keys(self, prefix: str) -> list[str]:

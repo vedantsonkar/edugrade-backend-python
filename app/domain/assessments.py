@@ -39,32 +39,24 @@ class AssessmentAttempt(UUID7PKMixin, TimestampMixin, Base):
     __tablename__ = "assessment_attempts"
 
     assignment_id: Mapped[str] = mapped_column(
-        UUID_KEY,
-        ForeignKey("assignments.id", ondelete="CASCADE"), index=True
+        UUID_KEY, ForeignKey("assignments.id", ondelete="CASCADE"), index=True
     )
     student_id: Mapped[str] = mapped_column(
-        UUID_KEY,
-        ForeignKey("users.id", ondelete="CASCADE"), index=True
+        UUID_KEY, ForeignKey("users.id", ondelete="CASCADE"), index=True
     )
-    started_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=utc_now
-    )
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     submitted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     score: Mapped[float | None] = mapped_column(Float)
     max_score: Mapped[float | None] = mapped_column(Float)
     tab_switch_count: Mapped[int] = mapped_column(Integer, default=0)
     grade_override: Mapped[float | None] = mapped_column(Float)
     is_overridden: Mapped[bool] = mapped_column(Boolean, default=False)
-    status: Mapped[AttemptStatus] = mapped_column(
-        default=AttemptStatus.IN_PROGRESS, index=True
-    )
+    status: Mapped[AttemptStatus] = mapped_column(default=AttemptStatus.IN_PROGRESS, index=True)
     proctoring_log: Mapped[dict[str, object] | None] = mapped_column(JSON)
 
-    assignment: Mapped["Assignment"] = relationship(
-        back_populates="attempts", lazy="selectin"
-    )
-    student: Mapped["User"] = relationship(back_populates="attempts")
-    answers: Mapped[list["StudentAnswer"]] = relationship(
+    assignment: Mapped[Assignment] = relationship(back_populates="attempts", lazy="selectin")
+    student: Mapped[User] = relationship(back_populates="attempts")
+    answers: Mapped[list[StudentAnswer]] = relationship(
         back_populates="attempt",
         cascade="all, delete-orphan",
         lazy="selectin",
@@ -126,16 +118,14 @@ class StudentAnswer(UUID7PKMixin, TimestampMixin, Base):
     __tablename__ = "student_answers"
 
     attempt_id: Mapped[str] = mapped_column(
-        UUID_KEY,
-        ForeignKey("assessment_attempts.id", ondelete="CASCADE"), index=True
+        UUID_KEY, ForeignKey("assessment_attempts.id", ondelete="CASCADE"), index=True
     )
     question_id: Mapped[str] = mapped_column(
-        UUID_KEY,
-        ForeignKey("questions.id", ondelete="CASCADE"), index=True
+        UUID_KEY, ForeignKey("questions.id", ondelete="CASCADE"), index=True
     )
     answer_data: Mapped[object] = mapped_column(JSON)
     is_correct: Mapped[bool | None] = mapped_column(Boolean)
     points_awarded: Mapped[float | None] = mapped_column(Float)
 
-    attempt: Mapped["AssessmentAttempt"] = relationship(back_populates="answers")
-    question: Mapped["Question"] = relationship(lazy="selectin")
+    attempt: Mapped[AssessmentAttempt] = relationship(back_populates="answers")
+    question: Mapped[Question] = relationship(lazy="selectin")

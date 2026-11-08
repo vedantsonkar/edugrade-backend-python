@@ -47,6 +47,7 @@ async def public_config(
         subdomain=school.subdomain,
         primary_color=school.primary_color,
         logo_url=school.logo_url,
+        logo_download_url=await service.public_logo(school),
     )
 
 

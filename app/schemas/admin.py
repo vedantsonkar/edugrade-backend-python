@@ -3,7 +3,7 @@
 from datetime import datetime
 from uuid import UUID
 
-from pydantic import Field
+from pydantic import Field, field_validator
 
 from app.schemas.common import BaseRequest, BaseSchema, IdStr
 from app.schemas.school import SchoolConfigResponse, SchoolSettingsResponse
@@ -243,6 +243,7 @@ class TeacherCreate(BaseRequest):
 
     email: str = Field(max_length=255)
     name: str = Field(min_length=1, max_length=255)
+    date_of_birth: datetime | None = None
     password: str | None = Field(default=None, max_length=1024)
     phone_country_code: str | None = Field(default=None, max_length=8)
     phone_number: str | None = Field(default=None, max_length=15)
@@ -259,6 +260,7 @@ class TeacherUpdate(BaseRequest):
     """
 
     name: str | None = Field(default=None, max_length=255)
+    date_of_birth: datetime | None = None
     email: str | None = Field(default=None, max_length=255)
     is_active: bool | None = None
     phone_country_code: str | None = Field(default=None, max_length=8)
@@ -286,6 +288,9 @@ class BulkUserCsvRequest(BaseRequest):
 
     csv: str = Field(min_length=1)
     dry_run: bool = False
+    operation: str = "upsert"
+    user_type: str = "teacher"
+    skip_invalid: bool = False
 
 
 class BulkUserRowResult(BaseSchema):
@@ -318,6 +323,10 @@ class BulkUserCsvResponse(BaseSchema):
     updated: int
     skipped: int
     errors: list[BulkUserRowResult]
+    valid: bool = True
+    total_rows: int = 0
+    valid_rows: int = 0
+    invalid_rows: int = 0
 
 
 class AdminStatsResponse(BaseSchema):
@@ -446,6 +455,7 @@ class UserStatusPath(BaseRequest):
 
     user_id: UUID
 
+
 class TeacherResponse(BaseSchema):
     """Teacher row for management listings.
 
@@ -465,6 +475,7 @@ class TeacherResponse(BaseSchema):
     email: str
     name: str
     role: str
+    date_of_birth: datetime | None = None
     avatar_url: str | None = None
     is_active: bool
     classes_taught: list[str] = []
@@ -473,3 +484,33 @@ class TeacherResponse(BaseSchema):
     last_login_at: datetime | None = None
     created_at: datetime
     updated_at: datetime
+
+
+    @field_validator("classes_taught", mode="before")
+    @classmethod
+    def classroom_ids(cls, value: object) -> object:
+        """Serialize loaded classroom relationships as stable ID strings."""
+        if isinstance(value, list):
+            return [str(getattr(item, "id", item)) for item in value]
+        return value
+
+
+class UserCountsResponse(BaseSchema):
+    """Activation counters for a tenant-scoped role."""
+
+    active: int
+    inactive: int
+
+
+class AuditArchiveResponse(BaseSchema):
+    """Object metadata for an archive available to a school administrator."""
+
+    key: str
+    size: int
+    last_modified: datetime | None
+
+
+class TeacherCreatedResponse(TeacherResponse):
+    """New teacher details with the initial password shown once to the admin."""
+
+    generated_password: str

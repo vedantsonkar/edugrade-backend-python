@@ -6,7 +6,7 @@ from fastapi import Request
 
 from app.core.pagination import Page, PageParams
 from app.core.security.principal import UserPrincipal
-from app.core.storage.base import ObjectStorage
+from app.core.storage.base import ObjectStorage, StoredObjectInfo
 from app.domain.audit import AuditLog
 from app.repositories.audit import AuditLogRepository
 from app.schemas.audit import AuditEventInput
@@ -87,9 +87,15 @@ class AuditService:
         )
         return Page.of(rows, total, params)
 
-    async def download_archive(
-        self, school_id: str, *, key: str
-    ) -> tuple[str, str, int]:
+    async def list_archives(self, school_id: str) -> list[StoredObjectInfo]:
+        """List archive metadata strictly under the authenticated school's prefix."""
+        return sorted(
+            await self._storage.list_objects(f"audit-logs/{school_id}/"),
+            key=lambda row: row.key,
+            reverse=True,
+        )
+
+    async def download_archive(self, school_id: str, *, key: str) -> tuple[str, str, int]:
         """Issue a pre-signed GET for an archived audit file.
 
         Args:

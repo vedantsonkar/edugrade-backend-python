@@ -23,6 +23,7 @@ class SchoolBrandingResponse(BaseSchema):
     subdomain: str
     primary_color: str
     logo_url: str | None = None
+    logo_download_url: str | None = None
 
 
 class ValidateAdminRequest(BaseRequest):

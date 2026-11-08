@@ -1,5 +1,5 @@
 .PHONY: install dev run seed upgrade downgrade revision lint format typecheck test \
-        test-cov docker-build docker-up docker-down psql clean
+        test-cov audit docker-build docker-up docker-down psql clean
 
 # ── Environment ──────────────────────────────────────────────────────────────
 install:
@@ -42,6 +42,9 @@ test:
 
 test-cov:
 	pytest --cov=app --cov-report=term-missing
+
+audit:
+	pip-audit
 
 # ── Docker ───────────────────────────────────────────────────────────────────
 docker-build:

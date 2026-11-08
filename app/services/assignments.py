@@ -1,6 +1,6 @@
 """Assignment use cases: CRUD, questions, submissions, comments."""
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import TYPE_CHECKING
 from uuid import UUID
 
@@ -29,21 +29,30 @@ from app.domain.users import User
 
 if TYPE_CHECKING:
     from sqlalchemy import Select
+from app.domain.enums import BatchGradingMode, BatchGradingTaskStatus, BatchGradingTrigger
+from app.domain.grading import BatchGradingTask
 from app.repositories.assignments import (
     AssignmentRepository,
     AssignmentTargetRepository,
     QuestionRepository,
     RubricCommentRepository,
 )
-from app.repositories.grading import AttachmentRepository, SubmissionRepository
+from app.repositories.grading import (
+    AttachmentRepository,
+    BatchGradingTaskRepository,
+    SubmissionRepository,
+)
 from app.repositories.taxonomy import ClassroomRepository
 from app.schemas.assignments import (
     AssignmentCreate,
+    AssignmentResponse,
     AssignmentUpdate,
+    AttemptSummary,
     QuestionCreate,
     QuestionUpdate,
     SubmissionCreate,
     SubmissionGradeRequest,
+    SubmissionResponse,
 )
 
 
@@ -61,6 +70,7 @@ class AssignmentService:
         attachments: AttachmentRepository,
         classrooms: ClassroomRepository,
         clock: Clock,
+        tasks: BatchGradingTaskRepository,
     ) -> None:
         """Inject repositories and the clock.
 
@@ -73,6 +83,7 @@ class AssignmentService:
             attachments: Attachment repository (hand-in files).
             classrooms: Classroom repository (target validation).
             clock: Time source.
+            tasks: Batch grading persistence.
         """
         self._assignments = assignments
         self._targets = targets
@@ -82,8 +93,104 @@ class AssignmentService:
         self._attachments = attachments
         self._classrooms = classrooms
         self._clock = clock
+        self._tasks = tasks
 
     # ── Queries ──────────────────────────────────────────────────────────
+
+    async def queue_grading(
+        self, principal: UserPrincipal, assignment_id: UUID, mode: str
+    ) -> BatchGradingTask:
+        """Queue offline grading once; reject invalid modes or active duplicate work.
+
+        Raises:
+            ConflictError: If active work exists or the assignment is online.
+            ValidationFailedError: If the mode is unknown.
+            ForbiddenError: If the caller cannot manage the assignment.
+        """
+        assignment = await self._require_manageable(principal, assignment_id)
+        if assignment.type != AssignmentType.OFFLINE:
+            raise ConflictError("Grade-all is available for offline assignments only.")
+        try:
+            selected_mode = BatchGradingMode(mode)
+        except ValueError as exc:
+            raise ValidationFailedError("Unknown grading mode.") from exc
+        await self._tasks.lock_assignment(assignment_id)
+        if await self._tasks.active_for_assignment(str(assignment_id)) is not None:
+            raise ConflictError("A grading task is already queued or running.")
+        return await self._tasks.add(
+            BatchGradingTask(
+                assignment_id=str(assignment_id),
+                school_id=str(principal.school_id),
+                trigger=BatchGradingTrigger.MANUAL,
+                mode=selected_mode,
+                status=BatchGradingTaskStatus.QUEUED,
+                created_by_id=str(principal.id),
+            )
+        )
+
+    async def latest_grading(
+        self, principal: UserPrincipal, assignment_id: UUID
+    ) -> BatchGradingTask | None:
+        """Read the latest task for an assignment the staff caller may view."""
+        await self.get_assignment(principal, assignment_id)
+        if principal.role not in (UserRole.TEACHER.value, UserRole.ADMIN.value):
+            raise ForbiddenError("Staff access required.")
+        return await self._tasks.latest_for_assignment(str(assignment_id))
+
+    def present(self, assignment: Assignment, principal: UserPrincipal) -> AssignmentResponse:
+        """Project viewer progress without exposing another student's data."""
+        from app.domain.enums import AttemptStatus
+
+        student = principal.role == UserRole.STUDENT.value
+        submissions = [
+            s
+            for s in assignment.submissions
+            if not student or str(s.student_id) == str(principal.id)
+        ]
+        attempts = [
+            a for a in assignment.attempts if not student or str(a.student_id) == str(principal.id)
+        ]
+        graded = any(
+            s.grade is not None or s.ai_grade_letter is not None or s.grade_override is not None
+            for s in submissions
+        )
+        graded = graded or (
+            (not student or assignment.show_results_after)
+            and any(a.effective_score is not None for a in attempts)
+        )
+        now = self._clock.now()
+        if graded:
+            state = "graded"
+        elif student and (
+            submissions or any(a.status == AttemptStatus.SUBMITTED for a in attempts)
+        ):
+            state = "submitted"
+        elif student and any(a.is_active for a in attempts):
+            state = "ongoing"
+        elif _aware(assignment.due_date) < now:
+            state = "overdue"
+        elif _aware(assignment.start_date) > now:
+            state = "upcoming"
+        elif _aware(assignment.due_date) <= now + timedelta(days=2):
+            state = "due_soon"
+        else:
+            state = "ongoing"
+        own_attempt = AttemptSummary.model_validate(attempts[0]) if student and attempts else None
+        if own_attempt is not None and not assignment.show_results_after:
+            own_attempt = own_attempt.model_copy(update={"score": None, "grade_override": None})
+        return AssignmentResponse.model_validate(assignment).model_copy(
+            update={
+                "state": state,
+                "submission_count": len(
+                    {str(s.student_id) for s in submissions}
+                    | {str(a.student_id) for a in attempts if not a.is_active}
+                ),
+                "my_submission": SubmissionResponse.model_validate(submissions[0])
+                if student and submissions
+                else None,
+                "my_attempt": own_attempt,
+            }
+        )
 
     async def list_assignments(
         self,
@@ -119,24 +226,37 @@ class AssignmentService:
         if principal.role == UserRole.STUDENT.value:
             class_ids_own = await self._student_class_ids(school_id, principal.id)
             items, total = await self._assignments.list_for_student(
-                school_id, class_ids_own, params,
-                q=q, class_filter=class_ids, state=state_filter, now=now,
+                school_id,
+                class_ids_own,
+                params,
+                student_id=str(principal.id),
+                q=q,
+                class_filter=class_ids,
+                state=state_filter,
+                now=now,
             )
         elif principal.role == UserRole.TEACHER.value:
             items, total = await self._assignments.list_for_teacher(
-                school_id, str(principal.id), params,
-                q=q, class_filter=class_ids, state=state_filter, now=now,
+                school_id,
+                str(principal.id),
+                params,
+                q=q,
+                class_filter=class_ids,
+                state=state_filter,
+                now=now,
             )
         else:
             items, total = await self._assignments.list_for_admin(
-                school_id, params,
-                q=q, class_filter=class_ids, state=state_filter, now=now,
+                school_id,
+                params,
+                q=q,
+                class_filter=class_ids,
+                state=state_filter,
+                now=now,
             )
         return Page.of(items, total, params)
 
-    async def get_assignment(
-        self, principal: UserPrincipal, assignment_id: UUID
-    ) -> Assignment:
+    async def get_assignment(self, principal: UserPrincipal, assignment_id: UUID) -> Assignment:
         """Fetch one assignment enforced to the caller's school and role.
 
         Students may only open targeted assignments.
@@ -275,9 +395,7 @@ class AssignmentService:
 
     # ── Questions ────────────────────────────────────────────────────────
 
-    async def list_questions(
-        self, principal: UserPrincipal, assignment_id: UUID
-    ) -> list[Question]:
+    async def list_questions(self, principal: UserPrincipal, assignment_id: UUID) -> list[Question]:
         """List an assignment's questions.
 
         Students receive the questions with ``is_correct`` and explanations
@@ -293,7 +411,7 @@ class AssignmentService:
         assignment = await self.get_assignment(principal, assignment_id)
         questions = await self._questions.list_for_assignment(str(assignment.id))
         if principal.role == UserRole.STUDENT.value:
-            self._sanitize_questions(questions)
+            return self._sanitize_questions(questions)
         return questions
 
     async def create_questions(
@@ -374,8 +492,36 @@ class AssignmentService:
         question = await self._questions.get_loaded(question_id)
         if question is None or str(question.assignment_id) != str(assignment_id):
             raise NotFoundError("Question not found.")
+        try:
+            selected_type = (
+                QuestionType(payload.type) if payload.type is not None else question.type
+            )
+        except ValueError as exc:
+            raise ValidationFailedError("Unknown question type.") from exc
+        from app.schemas.assignments import QuestionOptionCreate
+
+        candidate_options = (
+            payload.options
+            if payload.options is not None
+            else [
+                QuestionOptionCreate(
+                    text=o.text, is_correct=o.is_correct, display_order=o.display_order
+                )
+                for o in question.options
+            ]
+        )
+        if selected_type == QuestionType.FREE_TEXT:
+            candidate_options = []
+        candidate = QuestionCreate(
+            type=selected_type.value, text=payload.text or question.text, options=candidate_options
+        )
+        self._validate_question_payload(candidate)
         fields = payload.model_dump(exclude_unset=True)
         options = fields.pop("options", None)
+        if selected_type == QuestionType.FREE_TEXT:
+            options = []
+        fields.pop("type", None)
+        question.type = selected_type
         for key, value in fields.items():
             setattr(question, key, value)
         if options is not None:
@@ -432,9 +578,7 @@ class AssignmentService:
         if len(ordered_question_ids) != len(by_id) or not all(
             qid in by_id for qid in ordered_question_ids
         ):
-            raise ValidationFailedError(
-                "Reorder payload must contain every question exactly once."
-            )
+            raise ValidationFailedError("Reorder payload must contain every question exactly once.")
         for index, qid in enumerate(ordered_question_ids):
             by_id[qid].display_order = index + 1
         await self._questions.session.flush()
@@ -460,7 +604,11 @@ class AssignmentService:
         Returns:
             Paginated submissions.
         """
-        await self._require_manageable(principal, assignment_id)
+        await self.get_assignment(principal, assignment_id)
+        if principal.role == UserRole.STUDENT.value:
+            own = await self._submissions.get_for_student(str(assignment_id), str(principal.id))
+            rows = [own] if own is not None and (not only_ungraded or own.grade is None) else []
+            return Page.of(rows if params.page == 1 else [], len(rows), params)
         rows, total = await self._submissions.list_for_assignment(
             str(assignment_id), params, only_ungraded=only_ungraded
         )
@@ -489,13 +637,13 @@ class AssignmentService:
         assignment = await self.get_assignment(principal, assignment_id)
         if principal.role != UserRole.STUDENT.value:
             raise ForbiddenError("Only students submit assignments.")
-        existing = await self._submissions.get_for_student(
-            str(assignment.id), str(principal.id)
-        )
+        existing = await self._submissions.get_for_student(str(assignment.id), str(principal.id))
         if existing is not None:
             raise ConflictError("Assignment already submitted.")
         now = self._clock.now()
         due = _aware(assignment.due_date)
+        if now < _aware(assignment.start_date) or assignment.type != AssignmentType.OFFLINE:
+            raise ConflictError("The file submission window is not open.")
         if now > due and not assignment.allow_late_submissions:
             raise ConflictError("The submission window has closed.")
 
@@ -593,9 +741,7 @@ class AssignmentService:
 
     # ── Internals ────────────────────────────────────────────────────────
 
-    async def _student_class_ids(
-        self, school_id: str, student_id: UUID
-    ) -> list[str]:
+    async def _student_class_ids(self, school_id: str, student_id: UUID) -> list[str]:
         """Resolve the classrooms a student belongs to.
 
         Args:
@@ -609,9 +755,7 @@ class AssignmentService:
         rows = (await self._classrooms.session.execute(stmt)).scalars().all()
         return [str(row.id) for row in rows]
 
-    async def _validate_targets(
-        self, school_id: str, class_ids: list[str]
-    ) -> None:
+    async def _validate_targets(self, school_id: str, class_ids: list[str]) -> None:
         """Ensure target classrooms exist in the caller's school.
 
         Args:
@@ -623,15 +767,10 @@ class AssignmentService:
         """
         if not class_ids:
             return
-        known = {
-            str(c.id)
-            for c in await self._classrooms.list_for_school(school_id)
-        }
+        known = {str(c.id) for c in await self._classrooms.list_for_school(school_id)}
         unknown = set(class_ids) - known
         if unknown:
-            raise ValidationFailedError(
-                f"Unknown classroom targets: {', '.join(sorted(unknown))}"
-            )
+            raise ValidationFailedError(f"Unknown classroom targets: {', '.join(sorted(unknown))}")
 
     async def _require_manageable(
         self, principal: UserPrincipal, assignment_id: UUID
@@ -654,24 +793,43 @@ class AssignmentService:
         assignment = await self._assignments.get_scoped(assignment_id, principal.school_id)
         if assignment is None:
             raise NotFoundError("Assignment not found.")
-        if (
-            principal.role == UserRole.TEACHER.value
-            and str(assignment.teacher_id) != str(principal.id)
+        if principal.role == UserRole.TEACHER.value and str(assignment.teacher_id) != str(
+            principal.id
         ):
             raise ForbiddenError("Only the assignment's creator may manage it.")
         return assignment
 
     @staticmethod
-    def _sanitize_questions(questions: list[Question]) -> None:
-        """Strip correctness/explanations from questions in place.
-
-        Args:
-            questions: Questions to sanitize (mutated).
-        """
+    def _sanitize_questions(questions: list[Question]) -> list[Question]:
+        """Build detached student projections without changing stored correct answers."""
+        results: list[Question] = []
         for question in questions:
-            question.explanation = None
-            for option in question.options:
-                option.is_correct = False
+            clone = Question(
+                assignment_id=question.assignment_id,
+                type=question.type,
+                text=question.text,
+                points=question.points,
+                is_required=question.is_required,
+                display_order=question.display_order,
+                explanation=None,
+                min_char_length=question.min_char_length,
+                max_char_length=question.max_char_length,
+            )
+            clone.id = question.id
+            clone.created_at = question.created_at
+            clone.updated_at = question.updated_at
+            clone.options = [
+                QuestionOption(
+                    id=option.id,
+                    question_id=option.question_id,
+                    text=option.text,
+                    is_correct=False,
+                    display_order=option.display_order,
+                )
+                for option in question.options
+            ]
+            results.append(clone)
+        return results
 
     @staticmethod
     def _validate_question_payload(payload: QuestionCreate) -> None:
@@ -691,9 +849,7 @@ class AssignmentService:
             QuestionType.TRUE_FALSE,
         )
         if objective and len(payload.options) < 2:
-            raise ValidationFailedError(
-                f"{qtype.value} questions require at least two options."
-            )
+            raise ValidationFailedError(f"{qtype.value} questions require at least two options.")
         if not objective and payload.options:
             raise ValidationFailedError("Free-text questions take no options.")
         if objective and not any(o.is_correct for o in payload.options):
@@ -754,19 +910,7 @@ def _aware(value: datetime) -> datetime:
     return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
 
 
-def select_classrooms_for_student(
-    school_id: str, student_id: str
-) -> "Select[tuple[Classroom]]":
-    """Build the student→classrooms select (module-level for reuse in tests).
-
-    Args:
-        school_id: Tenant.
-        student_id: Student id.
-
-    Returns:
-        A SQLAlchemy select over :class:`Classroom` (typed loosely: the
-        statement is always executed within the caller's session).
-    """
+def select_classrooms_for_student(school_id: str, student_id: str) -> Select[Classroom]:
     """Build the student→classrooms select (module-level for reuse in tests).
 
     Args:

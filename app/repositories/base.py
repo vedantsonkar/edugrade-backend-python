@@ -6,7 +6,6 @@ decisions (AGENTS.md §2-S). All rows flow as ORM entities - DTO mapping is
 the service layer's job.
 """
 
-from typing import Generic, TypeVar
 from uuid import UUID
 
 from sqlalchemy import Select, func, select
@@ -15,10 +14,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.db.base import Base
 from app.core.pagination import PageParams
 
-ModelT = TypeVar("ModelT", bound=Base)
 
-
-class BaseRepository(Generic[ModelT]):
+class BaseRepository[ModelT: Base]:
     """Template repository for one ORM entity.
 
     Subclasses set :attr:`model` and receive a request-scoped session via
@@ -73,7 +70,7 @@ class BaseRepository(Generic[ModelT]):
 
     async def paginate(
         self,
-        stmt: Select[tuple[ModelT]],
+        stmt: Select[ModelT],
         params: PageParams,
     ) -> tuple[list[ModelT], int]:
         """Run a list statement with a count over the same filter.

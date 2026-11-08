@@ -40,16 +40,12 @@ class Submission(UUID7PKMixin, TimestampMixin, Base):
     __tablename__ = "submissions"
 
     assignment_id: Mapped[str] = mapped_column(
-        UUID_KEY,
-        ForeignKey("assignments.id", ondelete="CASCADE"), index=True
+        UUID_KEY, ForeignKey("assignments.id", ondelete="CASCADE"), index=True
     )
     student_id: Mapped[str] = mapped_column(
-        UUID_KEY,
-        ForeignKey("users.id", ondelete="CASCADE"), index=True
+        UUID_KEY, ForeignKey("users.id", ondelete="CASCADE"), index=True
     )
-    submitted_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=utc_now
-    )
+    submitted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     grade: Mapped[float | None] = mapped_column(Float)
     grade_override: Mapped[str | None] = mapped_column(String(32))
     is_overridden: Mapped[bool] = mapped_column(default=False)
@@ -60,11 +56,9 @@ class Submission(UUID7PKMixin, TimestampMixin, Base):
     plagiarism_analysis: Mapped[str | None] = mapped_column(Text)
     ai_grade_letter: Mapped[str | None] = mapped_column(String(8))
 
-    assignment: Mapped["Assignment"] = relationship(
-        back_populates="submissions", lazy="selectin"
-    )
-    student: Mapped["User"] = relationship(back_populates="submissions", lazy="selectin")
-    attachments: Mapped[list["Attachment"]] = relationship(
+    assignment: Mapped[Assignment] = relationship(back_populates="submissions", lazy="selectin")
+    student: Mapped[User] = relationship(back_populates="submissions", lazy="selectin")
+    attachments: Mapped[list[Attachment]] = relationship(
         back_populates="submission",
         cascade="all, delete-orphan",
         lazy="selectin",
@@ -73,11 +67,7 @@ class Submission(UUID7PKMixin, TimestampMixin, Base):
     @property
     def is_graded(self) -> bool:
         """Whether any grading result exists (AI or manual)."""
-        return (
-            self.grade is not None
-            or self.ai_grade_letter is not None
-            or self.is_overridden
-        )
+        return self.grade is not None or self.ai_grade_letter is not None or self.is_overridden
 
 
 class Attachment(UUID7PKMixin, Base):
@@ -94,18 +84,15 @@ class Attachment(UUID7PKMixin, Base):
     __tablename__ = "attachments"
 
     submission_id: Mapped[str] = mapped_column(
-        UUID_KEY,
-        ForeignKey("submissions.id", ondelete="CASCADE"), index=True
+        UUID_KEY, ForeignKey("submissions.id", ondelete="CASCADE"), index=True
     )
     name: Mapped[str] = mapped_column(String(255))
     type: Mapped[str] = mapped_column(String(128))
     url: Mapped[str] = mapped_column(String(512))
     size: Mapped[int | None] = mapped_column(Integer)
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=utc_now
-    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
-    submission: Mapped["Submission"] = relationship(back_populates="attachments")
+    submission: Mapped[Submission] = relationship(back_populates="attachments")
 
 
 class BatchGradingTask(UUID7PKMixin, TimestampMixin, Base):
@@ -134,12 +121,10 @@ class BatchGradingTask(UUID7PKMixin, TimestampMixin, Base):
     __tablename__ = "batch_grading_tasks"
 
     assignment_id: Mapped[str] = mapped_column(
-        UUID_KEY,
-        ForeignKey("assignments.id", ondelete="CASCADE"), index=True
+        UUID_KEY, ForeignKey("assignments.id", ondelete="CASCADE"), index=True
     )
     school_id: Mapped[str] = mapped_column(
-        UUID_KEY,
-        ForeignKey("schools.id", ondelete="CASCADE"), index=True
+        UUID_KEY, ForeignKey("schools.id", ondelete="CASCADE"), index=True
     )
     trigger: Mapped[BatchGradingTrigger] = mapped_column(index=True)
     mode: Mapped[BatchGradingMode] = mapped_column(default=BatchGradingMode.UNGRADED_ONLY)
@@ -147,8 +132,7 @@ class BatchGradingTask(UUID7PKMixin, TimestampMixin, Base):
         default=BatchGradingTaskStatus.QUEUED, index=True
     )
     created_by_id: Mapped[str | None] = mapped_column(
-        UUID_KEY,
-        ForeignKey("users.id", ondelete="SET NULL")
+        UUID_KEY, ForeignKey("users.id", ondelete="SET NULL")
     )
     total_submissions: Mapped[int] = mapped_column(Integer, default=0)
     processed_submissions: Mapped[int] = mapped_column(Integer, default=0)
@@ -163,8 +147,6 @@ class BatchGradingTask(UUID7PKMixin, TimestampMixin, Base):
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
-    assignment: Mapped["Assignment"] = relationship(
-        back_populates="batch_tasks", lazy="selectin"
-    )
-    school: Mapped["School"] = relationship(back_populates="batch_tasks")
-    created_by: Mapped["User | None"] = relationship(back_populates="batch_tasks_created")
+    assignment: Mapped[Assignment] = relationship(back_populates="batch_tasks", lazy="selectin")
+    school: Mapped[School] = relationship(back_populates="batch_tasks")
+    created_by: Mapped[User | None] = relationship(back_populates="batch_tasks_created")

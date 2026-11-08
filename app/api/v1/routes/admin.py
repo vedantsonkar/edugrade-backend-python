@@ -12,6 +12,7 @@ from app.api.v1.deps import (
     get_admin_service,
     get_audit_service,
     get_school_repo,
+    get_school_service,
 )
 from app.core.errors import ForbiddenError, NotFoundError
 from app.core.pagination import Page, PageParams, page_params
@@ -21,6 +22,7 @@ from app.domain.users import User
 from app.repositories.schools import SchoolRepository
 from app.schemas.admin import (
     AdminStatsResponse,
+    AuditArchiveResponse,
     AuditDownloadResponse,
     AuditLogResponse,
     BulkUserCsvRequest,
@@ -40,14 +42,17 @@ from app.schemas.admin import (
     StudentResponse,
     StudentUpdate,
     TeacherCreate,
+    TeacherCreatedResponse,
     TeacherResponse,
     TeacherUpdate,
+    UserCountsResponse,
     UserStatusUpdate,
     UserSummary,
 )
-from app.schemas.school import SchoolSettingsResponse
+from app.schemas.school import SchoolSettingsResponse, SchoolSettingsUpdate
 from app.services.admin import AdminService
 from app.services.audit import AuditService
+from app.services.schools import SchoolService
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
@@ -217,8 +222,7 @@ async def list_grades(
         Ordered grades.
     """
     return [
-        GradeResponse.model_validate(g)
-        for g in await service.list_grades(_school(current_user))
+        GradeResponse.model_validate(g) for g in await service.list_grades(_school(current_user))
     ]
 
 
@@ -374,7 +378,12 @@ async def bulk_students(
     from app.domain.enums import UserRole
 
     return await service.bulk_import_users(
-        _school(current_user), payload.csv, dry_run=payload.dry_run, role=UserRole.STUDENT
+        _school(current_user),
+        payload.csv,
+        dry_run=payload.dry_run,
+        role=UserRole.STUDENT,
+        operation=payload.operation,
+        skip_invalid=payload.skip_invalid,
     )
 
 
@@ -415,12 +424,12 @@ async def list_teachers(
     )
 
 
-@router.post("/teachers", response_model=TeacherResponse, summary="Create teacher")
+@router.post("/teachers", response_model=TeacherCreatedResponse, summary="Create teacher")
 async def create_teacher(
     payload: TeacherCreate,
     current_user: AdminUser,
     service: Annotated[AdminService, Depends(get_admin_service)],
-) -> TeacherResponse:
+) -> TeacherCreatedResponse:
     """Create a teacher account.
 
     Args:
@@ -432,7 +441,10 @@ async def create_teacher(
         The created teacher.
     """
     teacher = await service.create_teacher(_school(current_user), payload)
-    return TeacherResponse.model_validate(teacher)
+    return TeacherCreatedResponse(
+        **TeacherResponse.model_validate(teacher.user).model_dump(),
+        generated_password=teacher.generated_password,
+    )
 
 
 @router.patch(
@@ -485,7 +497,12 @@ async def bulk_teachers(
     from app.domain.enums import UserRole
 
     return await service.bulk_import_users(
-        _school(current_user), payload.csv, dry_run=payload.dry_run, role=UserRole.TEACHER
+        _school(current_user),
+        payload.csv,
+        dry_run=payload.dry_run,
+        role=UserRole.STUDENT if payload.user_type == "student" else UserRole.TEACHER,
+        operation=payload.operation,
+        skip_invalid=payload.skip_invalid,
     )
 
 
@@ -612,9 +629,7 @@ async def school_setup(
     return SchoolSetupResponse(
         school=SchoolSettingsResponse.model_validate(payload.school),
         grades=[
-            GradeWithStudentCount(
-                grade=GradeResponse.model_validate(grade), student_count=count
-            )
+            GradeWithStudentCount(grade=GradeResponse.model_validate(grade), student_count=count)
             for grade, count in payload.grades
         ],
         divisions=[
@@ -647,9 +662,7 @@ async def audit_list(
     Returns:
         Paginated audit logs.
     """
-    page = await service.list_events(
-        _school(current_user), params, action=action, user_id=userId
-    )
+    page = await service.list_events(_school(current_user), params, action=action, user_id=userId)
     return Page[AuditLogResponse](
         items=[AuditLogResponse.model_validate(log) for log in page.items],
         page=page.page,
@@ -679,9 +692,7 @@ async def audit_download(
     Returns:
         Download grant.
     """
-    key_out, url, expires_in = await service.download_archive(
-        _school(current_user), key=key
-    )
+    key_out, url, expires_in = await service.download_archive(_school(current_user), key=key)
     return AuditDownloadResponse(key=key_out, url=url, expires_in=expires_in)
 
 
@@ -706,7 +717,7 @@ def _school(principal: object) -> str:
     return str(school_id)
 
 
-def _student_page(page: "Page[User]") -> Page[StudentResponse]:
+def _student_page(page: Page[User]) -> Page[StudentResponse]:
     """Map a user page onto the student response schema.
 
     Args:
@@ -722,3 +733,46 @@ def _student_page(page: "Page[User]") -> Page[StudentResponse]:
         total=page.total,
         total_pages=page.total_pages,
     )
+
+
+@router.get("/school/settings", response_model=SchoolSettingsResponse)
+async def get_school_settings(
+    current_user: AdminUser,
+    service: Annotated[SchoolService, Depends(get_school_service)],
+) -> SchoolSettingsResponse:
+    """Read the administrator's own school settings."""
+    return SchoolSettingsResponse.model_validate(await service.get_settings(_school(current_user)))
+
+
+@router.patch("/school/settings", response_model=SchoolSettingsResponse)
+async def patch_school_settings(
+    payload: SchoolSettingsUpdate,
+    current_user: AdminUser,
+    service: Annotated[SchoolService, Depends(get_school_service)],
+) -> SchoolSettingsResponse:
+    """Update the administrator's own school and feature configuration."""
+    school = await service.update_settings(_school(current_user), payload)
+    return SchoolSettingsResponse.model_validate(school)
+
+
+@router.get("/user-counts", response_model=UserCountsResponse)
+async def user_counts(
+    current_user: AdminUser,
+    service: Annotated[AdminService, Depends(get_admin_service)],
+    role: str = "STUDENT",
+) -> UserCountsResponse:
+    """Return activation counters independent of list filters and pagination."""
+    active, inactive = await service.user_counts(_school(current_user), role)
+    return UserCountsResponse(active=active, inactive=inactive)
+
+
+@router.get("/audit/archives", response_model=list[AuditArchiveResponse])
+async def audit_archives(
+    current_user: AdminUser,
+    service: Annotated[AuditService, Depends(get_audit_service)],
+) -> list[AuditArchiveResponse]:
+    """List archived audit objects belonging to the administrator's school."""
+    return [
+        AuditArchiveResponse(key=row.key, size=row.size, last_modified=row.last_modified)
+        for row in await service.list_archives(_school(current_user))
+    ]

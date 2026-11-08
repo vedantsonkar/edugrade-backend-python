@@ -1,5 +1,6 @@
 """Authentication routes: login, refresh rotation, logout, session, OAuth."""
 
+import hmac
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, Request, Response
@@ -83,12 +84,15 @@ def _clear_cookies(response: Response, container: Container) -> None:
         response.delete_cookie(name, **_cookie_params(container))
 
 
-def _to_login_response(result: LoginResult, expires_in: int) -> LoginResponse:
+def _to_login_response(
+    result: LoginResult, expires_in: int, cookie_only: bool = False
+) -> LoginResponse:
     """Map a service result onto the wire schema.
 
     Args:
         result: Login result.
         expires_in: Access token lifetime in seconds.
+        cookie_only: Suppress explicit tokens for browser gateway requests.
 
     Returns:
         Response schema.
@@ -113,7 +117,9 @@ def _to_login_response(result: LoginResult, expires_in: int) -> LoginResponse:
             access_token=result.access_token,
             refresh_token=result.refresh.token,
             expires_in=expires_in,
-        ),
+        )
+        if not cookie_only
+        else None,
     )
 
 
@@ -125,6 +131,7 @@ def _to_login_response(result: LoginResult, expires_in: int) -> LoginResponse:
 )
 async def login(
     payload: LoginRequest,
+    request: Request,
     response: Response,
     auth: Annotated[AuthService, Depends(get_auth_service)],
     container: Container = ContainerDep,
@@ -133,6 +140,7 @@ async def login(
 
     Args:
         payload: Login credentials and optional school/portal context.
+        request: Browser gateway indicator.
         response: Outgoing response (cookies attached).
         auth: Auth service.
         container: App container.
@@ -148,7 +156,9 @@ async def login(
     )
     _set_cookies(response, container, result.access_token, result.refresh.token)
     return _to_login_response(
-        result, container.settings.access_token_expire_minutes * 60
+        result,
+        container.settings.access_token_expire_minutes * 60,
+        cookie_only=request.headers.get("x-edugrade-browser") == "1",
     )
 
 
@@ -179,15 +189,15 @@ async def refresh(
     Raises:
         UnauthorizedError: On invalid/revoked/expired refresh tokens.
     """
-    token = (payload.refresh_token if payload else None) or request.cookies.get(
-        REFRESH_COOKIE
-    )
+    token = (payload.refresh_token if payload else None) or request.cookies.get(REFRESH_COOKIE)
     if not token:
         raise UnauthorizedError("No refresh token provided.")
     result = await auth.refresh(token)
     _set_cookies(response, container, result.access_token, result.refresh.token)
     return _to_login_response(
-        result, container.settings.access_token_expire_minutes * 60
+        result,
+        container.settings.access_token_expire_minutes * 60,
+        cookie_only=request.headers.get("x-edugrade-browser") == "1",
     )
 
 
@@ -213,9 +223,7 @@ async def logout(
     Returns:
         Acknowledgement payload.
     """
-    token = (payload.refresh_token if payload else None) or request.cookies.get(
-        REFRESH_COOKIE
-    )
+    token = (payload.refresh_token if payload else None) or request.cookies.get(REFRESH_COOKIE)
     await auth.logout(token)
     _clear_cookies(response, container)
     return {"status": "logged_out"}
@@ -246,6 +254,7 @@ async def me(
         email=user.email,
         name=user.name,
         role=user.role.value,
+        avatar_url=user.avatar_url,
         school_id=str(user.school_id),
         school_name=school.name if school else None,
         school_primary_color=school.primary_color if school else None,
@@ -259,6 +268,7 @@ async def me(
 async def google_start(
     request: Request,
     oauth: Annotated[GoogleOAuthService, Depends(get_google_oauth_service)],
+    container: Container = ContainerDep,
 ) -> RedirectResponse:
     """Redirect the browser to Google's consent screen.
 
@@ -266,12 +276,19 @@ async def google_start(
         request: Incoming request (optional ``school`` query param carries
             the login page's subdomain into the signed state).
         oauth: OAuth service.
+        container: Cookie configuration.
 
     Returns:
         Redirect response.
     """
     subdomain = request.query_params.get("school")
-    return RedirectResponse(oauth.authorization_url(subdomain))
+    url = oauth.authorization_url(subdomain)
+    from urllib.parse import parse_qs, urlparse
+
+    state = parse_qs(urlparse(url).query)["state"][0]
+    response = RedirectResponse(url)
+    response.set_cookie("oauth_state", state, max_age=600, **_cookie_params(container))
+    return response
 
 
 @router.get("/google/callback", summary="Google OAuth callback")
@@ -291,6 +308,12 @@ async def google_callback(
         Redirect response to the frontend (``/auth/error`` carries the
         failure message; success sets cookies).
     """
+    state = request.query_params.get("state", "")
+    expected = request.cookies.get("oauth_state", "")
+    if not state or not expected or not hmac.compare_digest(state, expected):
+        return RedirectResponse(
+            f"{container.settings.frontend_url.rstrip('/')}/auth/error?message=Invalid%20OAuth%20state"
+        )
     result = await oauth.handle_callback(
         code=request.query_params.get("code"),
         state=request.query_params.get("state"),
@@ -302,7 +325,5 @@ async def google_callback(
 
         return RedirectResponse(f"{frontend}/auth/error?message={quote(message)}")
     response = RedirectResponse(f"{frontend}/auth/success")
-    _set_cookies(
-        response, container, result.login.access_token, result.login.refresh.token
-    )
+    _set_cookies(response, container, result.login.access_token, result.login.refresh.token)
     return response

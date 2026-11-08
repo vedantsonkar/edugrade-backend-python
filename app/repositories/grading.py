@@ -56,9 +56,7 @@ class SubmissionRepository(BaseRepository[Submission]):
         )
         return (await self.session.execute(stmt)).scalar_one_or_none()
 
-    async def get_for_student(
-        self, assignment_id: str, student_id: str
-    ) -> Submission | None:
+    async def get_for_student(self, assignment_id: str, student_id: str) -> Submission | None:
         """Fetch a student's submission for an assignment.
 
         Args:
@@ -68,9 +66,13 @@ class SubmissionRepository(BaseRepository[Submission]):
         Returns:
             The submission, or ``None``.
         """
-        stmt = select(Submission).where(
-            Submission.assignment_id == assignment_id,
-            Submission.student_id == student_id,
+        stmt = (
+            select(Submission)
+            .options(selectinload(Submission.student), selectinload(Submission.attachments))
+            .where(
+                Submission.assignment_id == assignment_id,
+                Submission.student_id == student_id,
+            )
         )
         return (await self.session.execute(stmt)).scalar_one_or_none()
 
@@ -102,9 +104,7 @@ class SubmissionRepository(BaseRepository[Submission]):
         stmt = stmt.order_by(Submission.submitted_at.asc())
         return await self.paginate(stmt, params)
 
-    async def count_for_assignment(
-        self, assignment_id: str, *, only_ungraded: bool = False
-    ) -> int:
+    async def count_for_assignment(self, assignment_id: str, *, only_ungraded: bool = False) -> int:
         """Count submissions of an assignment.
 
         Args:
@@ -140,6 +140,28 @@ class BatchGradingTaskRepository(BaseRepository[BatchGradingTask]):
 
     model = BatchGradingTask
 
+    async def lock_assignment(self, assignment_id: UUID) -> None:
+        """Serialize task creation on the owning assignment row."""
+        from app.domain.assignments import Assignment
+
+        await self.session.execute(
+            select(Assignment.id).where(Assignment.id == assignment_id).with_for_update()
+        )
+
+    async def active_for_assignment(self, assignment_id: str) -> BatchGradingTask | None:
+        """Return an active task for deduplication under the assignment lock."""
+        stmt = (
+            select(BatchGradingTask)
+            .where(
+                BatchGradingTask.assignment_id == assignment_id,
+                BatchGradingTask.status.in_(
+                    [BatchGradingTaskStatus.QUEUED, BatchGradingTaskStatus.RUNNING]
+                ),
+            )
+            .limit(1)
+        )
+        return (await self.session.execute(stmt)).scalar_one_or_none()
+
     async def list_by_status(
         self, status: BatchGradingTaskStatus, limit: int = 10
     ) -> list[BatchGradingTask]:
@@ -161,9 +183,7 @@ class BatchGradingTaskRepository(BaseRepository[BatchGradingTask]):
         rows = (await self.session.execute(stmt)).scalars().all()
         return list(rows)
 
-    async def latest_for_assignment(
-        self, assignment_id: str
-    ) -> BatchGradingTask | None:
+    async def latest_for_assignment(self, assignment_id: str) -> BatchGradingTask | None:
         """Fetch the most recent task of an assignment.
 
         Args:

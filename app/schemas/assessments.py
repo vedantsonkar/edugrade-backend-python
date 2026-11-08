@@ -4,6 +4,7 @@ from datetime import datetime
 
 from pydantic import Field
 
+from app.schemas.admin import UserSummary
 from app.schemas.assignments import QuestionResponse
 from app.schemas.common import BaseRequest, BaseSchema, IdStr
 
@@ -71,6 +72,7 @@ class AttemptResponse(BaseSchema):
     grade_override: float | None = None
     is_overridden: bool = False
     status: str
+    student: UserSummary | None = None
     proctoring_log: dict[str, object] | None = None
     answers: list[StudentAnswerResponse] = []
 
@@ -179,7 +181,7 @@ class SubmitResponse(BaseSchema):
     """
 
     attempt: AttemptResponse
-    score: float
+    score: float | None
     max_score: float
     percentage: float | None = None
 
@@ -191,7 +193,8 @@ class AttemptGradeRequest(BaseRequest):
         grade_override: New score in points.
     """
 
-    grade_override: float = Field(ge=0)
+    grade_override: float | None = Field(default=None, ge=0)
+    question_overrides: dict[str, float] = Field(default_factory=dict)
 
 
 class ReviewResponse(BaseSchema):
@@ -206,3 +209,11 @@ class ReviewResponse(BaseSchema):
     attempt: AttemptResponse
     questions: list[QuestionResponse]
     answers: list[StudentAnswerResponse]
+    snapshots: list[ReviewSnapshot] = []
+
+
+class ReviewSnapshot(BaseSchema):
+    """A temporary download grant for a review snapshot."""
+
+    url: str
+    timestamp: str

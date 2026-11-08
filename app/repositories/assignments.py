@@ -1,14 +1,15 @@
 """Repositories for assignments, targets, questions, and rubric comments."""
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from uuid import UUID
 
-from sqlalchemy import ColumnElement, Select, false, func, or_, select
+from sqlalchemy import ColumnElement, Select, and_, case, false, func, or_, select, true
 from sqlalchemy.orm import selectinload
 
 from app.core.pagination import PageParams
+from app.domain.assessments import AssessmentAttempt
 from app.domain.assignments import Assignment, AssignmentTarget, Question, RubricComment
-from app.domain.enums import AssignmentState, AssignmentType
+from app.domain.enums import AssignmentState, AssignmentType, AttemptStatus
 from app.domain.grading import Submission
 from app.domain.taxonomy import Classroom
 from app.domain.users import User  # noqa: F401 - registers mapper for module-level selectinload
@@ -17,6 +18,9 @@ from app.repositories.base import BaseRepository
 _ASSIGNMENT_LOADS = (
     selectinload(Assignment.targets).selectinload(AssignmentTarget.classroom),
     selectinload(Assignment.teacher),
+    selectinload(Assignment.submissions).selectinload(Submission.student),
+    selectinload(Assignment.submissions).selectinload(Submission.attachments),
+    selectinload(Assignment.attempts).selectinload(AssessmentAttempt.student),
 )
 """Standard eager loads for assignment list/detail reads."""
 
@@ -34,34 +38,60 @@ def _text_condition(q: str) -> ColumnElement[bool]:
     return or_(Assignment.title.ilike(like), Assignment.subject.ilike(like))
 
 
-def _state_condition(state: AssignmentState, now: datetime) -> ColumnElement[bool]:
-    """Translate a lifecycle state into a SQL condition.
-
-    Date states use the assignment window; submission/graded states check
-    for matching submissions. Per-student scoping is applied by the service
-    where relevant.
-
-    Args:
-        state: Requested lifecycle state.
-        now: Current instant.
-
-    Returns:
-        Boolean SQL condition.
-    """
-    if state is AssignmentState.UPCOMING:
-        return Assignment.start_date > now
-    if state is AssignmentState.ONGOING:
-        return (Assignment.start_date <= now) & (Assignment.due_date >= now)
-    if state is AssignmentState.OVERDUE:
-        return Assignment.due_date < now
-    if state is AssignmentState.SUBMITTED:
-        return Assignment.submissions.any()
-    graded = or_(
-        Submission.grade.is_not(None),
-        Submission.ai_grade_letter.is_not(None),
-        Submission.is_overridden.is_(True),
+def _state_condition(
+    state: AssignmentState,
+    now: datetime,
+    student_id: str | None = None,
+) -> ColumnElement[bool]:
+    """Filter by the same precedence used for viewer-facing state badges."""
+    submission_scope = Submission.student_id == student_id if student_id else true()
+    attempt_scope = AssessmentAttempt.student_id == student_id if student_id else true()
+    graded_attempt_scope = (
+        and_(attempt_scope, Assignment.show_results_after.is_(True))
+        if student_id
+        else attempt_scope
     )
-    return Assignment.submissions.any(graded)
+    graded = or_(
+        Assignment.submissions.any(
+            and_(
+                submission_scope,
+                or_(
+                    Submission.grade.is_not(None),
+                    Submission.ai_grade_letter.is_not(None),
+                    Submission.grade_override.is_not(None),
+                ),
+            )
+        ),
+        Assignment.attempts.any(
+            and_(
+                graded_attempt_scope,
+                or_(
+                    AssessmentAttempt.score.is_not(None),
+                    AssessmentAttempt.grade_override.is_not(None),
+                ),
+            )
+        ),
+    )
+    submitted = or_(
+        Assignment.submissions.any(submission_scope),
+        Assignment.attempts.any(
+            and_(attempt_scope, AssessmentAttempt.status == AttemptStatus.SUBMITTED)
+        ),
+    )
+    active = Assignment.attempts.any(
+        and_(attempt_scope, AssessmentAttempt.status == AttemptStatus.IN_PROGRESS)
+    )
+    choices = [(graded, "graded")]
+    if student_id:
+        choices.extend([(submitted, "submitted"), (active, "ongoing")])
+    choices.extend(
+        [
+            (Assignment.due_date < now, "overdue"),
+            (Assignment.start_date > now, "upcoming"),
+            (Assignment.due_date <= now + timedelta(days=2), "due_soon"),
+        ]
+    )
+    return case(*choices, else_="ongoing") == state.value
 
 
 class AssignmentRepository(BaseRepository[Assignment]):
@@ -88,12 +118,13 @@ class AssignmentRepository(BaseRepository[Assignment]):
 
     async def _paginated_filtered(
         self,
-        base: Select[tuple[Assignment]],
+        base: Select[Assignment],
         params: PageParams,
         *,
         q: str | None,
         state: AssignmentState | None,
         now: datetime,
+        student_id: str | None = None,
     ) -> tuple[list[Assignment], int]:
         """Apply shared text/state filters and paginate a base select.
 
@@ -103,6 +134,7 @@ class AssignmentRepository(BaseRepository[Assignment]):
             q: Title/subject substring filter.
             state: Optional lifecycle-state filter.
             now: Current instant for date-based states.
+            student_id: Owner of student-specific progress, otherwise staff.
 
         Returns:
             Tuple of (assignments, total).
@@ -111,7 +143,7 @@ class AssignmentRepository(BaseRepository[Assignment]):
         if q:
             stmt = stmt.where(_text_condition(q))
         if state is not None:
-            stmt = stmt.where(_state_condition(state, now))
+            stmt = stmt.where(_state_condition(state, now, student_id))
         stmt = stmt.order_by(Assignment.due_date.asc(), Assignment.created_at.desc())
         return await self.paginate(stmt, params)
 
@@ -125,6 +157,7 @@ class AssignmentRepository(BaseRepository[Assignment]):
         class_filter: list[str] | None = None,
         state: AssignmentState | None = None,
         now: datetime,
+        student_id: str,
     ) -> tuple[list[Assignment], int]:
         """List assignments targeted at the student's classrooms.
 
@@ -136,20 +169,25 @@ class AssignmentRepository(BaseRepository[Assignment]):
             class_filter: Optional client-side classroom filter.
             state: Optional lifecycle-state filter.
             now: Current instant.
+            student_id: Authenticated student owning the progress.
 
         Returns:
             Tuple of (assignments, total).
         """
-        target_ids = class_filter if class_filter is not None else class_ids
-        base = (
-            select(Assignment)
-            .join(AssignmentTarget, AssignmentTarget.assignment_id == Assignment.id)
-            .where(
-                Assignment.school_id == school_id,
-                AssignmentTarget.class_id.in_(target_ids) if target_ids else false(),
-            )
+        target_ids = (
+            list(set(class_ids).intersection(class_filter))
+            if class_filter is not None
+            else class_ids
         )
-        return await self._paginated_filtered(base, params, q=q, state=state, now=now)
+        base = select(Assignment).where(
+            Assignment.school_id == school_id,
+            Assignment.targets.any(AssignmentTarget.class_id.in_(target_ids))
+            if target_ids
+            else false(),
+        )
+        return await self._paginated_filtered(
+            base, params, q=q, state=state, now=now, student_id=student_id
+        )
 
     async def list_for_teacher(
         self,
@@ -192,9 +230,7 @@ class AssignmentRepository(BaseRepository[Assignment]):
             ),
         )
         if class_filter is not None:
-            base = base.where(
-                Assignment.targets.any(AssignmentTarget.class_id.in_(class_filter))
-            )
+            base = base.where(Assignment.targets.any(AssignmentTarget.class_id.in_(class_filter)))
         return await self._paginated_filtered(base, params, q=q, state=state, now=now)
 
     async def list_for_admin(
@@ -222,14 +258,10 @@ class AssignmentRepository(BaseRepository[Assignment]):
         """
         base = select(Assignment).where(Assignment.school_id == school_id)
         if class_filter is not None:
-            base = base.where(
-                Assignment.targets.any(AssignmentTarget.class_id.in_(class_filter))
-            )
+            base = base.where(Assignment.targets.any(AssignmentTarget.class_id.in_(class_filter)))
         return await self._paginated_filtered(base, params, q=q, state=state, now=now)
 
-    async def find_due_for_auto_grading(
-        self, now: datetime, limit: int = 50
-    ) -> list[Assignment]:
+    async def find_due_for_auto_grading(self, now: datetime, limit: int = 50) -> list[Assignment]:
         """Find offline assignments whose due-date auto grading is pending.
 
         Args:
@@ -261,11 +293,7 @@ class AssignmentRepository(BaseRepository[Assignment]):
         Returns:
             Assignment count.
         """
-        stmt = (
-            select(func.count())
-            .select_from(Assignment)
-            .where(Assignment.school_id == school_id)
-        )
+        stmt = select(func.count()).select_from(Assignment).where(Assignment.school_id == school_id)
         return int((await self.session.execute(stmt)).scalar_one())
 
 
@@ -274,9 +302,7 @@ class AssignmentTargetRepository(BaseRepository[AssignmentTarget]):
 
     model = AssignmentTarget
 
-    async def replace_for_assignment(
-        self, assignment_id: str, class_ids: list[str]
-    ) -> None:
+    async def replace_for_assignment(self, assignment_id: str, class_ids: list[str]) -> None:
         """Replace the target set of an assignment.
 
         Args:
@@ -285,9 +311,7 @@ class AssignmentTargetRepository(BaseRepository[AssignmentTarget]):
         """
         existing = (
             await self.session.execute(
-                select(AssignmentTarget).where(
-                    AssignmentTarget.assignment_id == assignment_id
-                )
+                select(AssignmentTarget).where(AssignmentTarget.assignment_id == assignment_id)
             )
         ).scalars()
         for row in existing:
@@ -343,9 +367,8 @@ class QuestionRepository(BaseRepository[Question]):
         Returns:
             One past the current maximum (0 when empty).
         """
-        stmt = (
-            select(func.max(Question.display_order))
-            .where(Question.assignment_id == assignment_id)
+        stmt = select(func.max(Question.display_order)).where(
+            Question.assignment_id == assignment_id
         )
         current = (await self.session.execute(stmt)).scalar_one()
         return int(current or 0) + 1

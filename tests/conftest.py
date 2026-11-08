@@ -7,7 +7,6 @@ import app.domain.assignments
 import app.domain.audit
 import app.domain.grading
 import pytest
-import pytest_asyncio
 import uuid_utils.compat as uuid_compat
 from app.api.v1.deps import Container
 from app.core.config import Settings
@@ -80,7 +79,7 @@ def storage() -> InMemoryStorage:
     return InMemoryStorage()
 
 
-@pytest_asyncio.fixture()
+@pytest.fixture
 async def db_sessionmaker() -> AsyncIterator[async_sessionmaker[AsyncSession]]:
     """In-memory sqlite sessionmaker with all tables created.
 
@@ -96,8 +95,6 @@ async def db_sessionmaker() -> AsyncIterator[async_sessionmaker[AsyncSession]]:
         await conn.run_sync(Base.metadata.create_all)
     yield async_sessionmaker(engine, expire_on_commit=False)
     await engine.dispose()
-
-
 
 
 @pytest.fixture
@@ -171,7 +168,7 @@ def client(app: FastAPI) -> TestClient:
     return TestClient(app)
 
 
-@pytest_asyncio.fixture()
+@pytest.fixture
 async def seeded_ids(
     db_sessionmaker: async_sessionmaker[AsyncSession],
     hasher: BcryptPasswordHasher,

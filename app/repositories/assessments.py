@@ -34,13 +34,13 @@ class AssessmentAttemptRepository(BaseRepository[AssessmentAttempt]):
                 AssessmentAttempt.assignment_id == assignment_id,
                 AssessmentAttempt.student_id == student_id,
             )
-            .options(selectinload(AssessmentAttempt.answers))
+            .options(
+                selectinload(AssessmentAttempt.answers), selectinload(AssessmentAttempt.student)
+            )
         )
         return (await self.session.execute(stmt)).scalar_one_or_none()
 
-    async def get_active(
-        self, assignment_id: UUID, student_id: str
-    ) -> AssessmentAttempt | None:
+    async def get_active(self, assignment_id: UUID, student_id: str) -> AssessmentAttempt | None:
         """Fetch a student's in-progress attempt, if any.
 
         Args:
@@ -57,13 +57,13 @@ class AssessmentAttemptRepository(BaseRepository[AssessmentAttempt]):
                 AssessmentAttempt.student_id == student_id,
                 AssessmentAttempt.status == AttemptStatus.IN_PROGRESS,
             )
-            .options(selectinload(AssessmentAttempt.answers))
+            .options(
+                selectinload(AssessmentAttempt.answers), selectinload(AssessmentAttempt.student)
+            )
         )
         return (await self.session.execute(stmt)).scalar_one_or_none()
 
-    async def get_by_id(
-        self, attempt_id: UUID, school_id: str
-    ) -> AssessmentAttempt | None:
+    async def get_by_id(self, attempt_id: UUID, school_id: str) -> AssessmentAttempt | None:
         """Fetch an attempt enforced to a school (join through assignment).
 
         Args:
@@ -80,7 +80,9 @@ class AssessmentAttemptRepository(BaseRepository[AssessmentAttempt]):
                 AssessmentAttempt.id == attempt_id,
                 AssessmentAttempt.assignment.has(school_id=school_id),
             )
-            .options(selectinload(AssessmentAttempt.answers))
+            .options(
+                selectinload(AssessmentAttempt.answers), selectinload(AssessmentAttempt.student)
+            )
         )
         return (await self.session.execute(stmt)).scalar_one_or_none()
 
@@ -99,6 +101,9 @@ class AssessmentAttemptRepository(BaseRepository[AssessmentAttempt]):
         stmt = (
             select(AssessmentAttempt)
             .where(AssessmentAttempt.assignment_id == assignment_id)
+            .options(
+                selectinload(AssessmentAttempt.answers), selectinload(AssessmentAttempt.student)
+            )
             .order_by(AssessmentAttempt.started_at.desc())
         )
         return await self.paginate(stmt, params)
@@ -109,9 +114,19 @@ class StudentAnswerRepository(BaseRepository[StudentAnswer]):
 
     model = StudentAnswer
 
-    async def get_for_question(
-        self, attempt_id: str, question_id: str
-    ) -> StudentAnswer | None:
+    async def list_for_attempt(self, attempt_id: str) -> list[StudentAnswer]:
+        """Read all answers when recomputing an overridden total."""
+        return list(
+            (
+                await self.session.execute(
+                    select(StudentAnswer).where(StudentAnswer.attempt_id == attempt_id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+    async def get_for_question(self, attempt_id: str, question_id: str) -> StudentAnswer | None:
         """Fetch a student's saved answer for one question.
 
         Args:

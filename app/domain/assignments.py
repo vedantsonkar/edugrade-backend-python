@@ -48,16 +48,12 @@ class Assignment(UUID7PKMixin, TimestampMixin, Base):
     __tablename__ = "assignments"
 
     school_id: Mapped[str] = mapped_column(
-        UUID_KEY,
-        ForeignKey("schools.id", ondelete="CASCADE"), index=True
+        UUID_KEY, ForeignKey("schools.id", ondelete="CASCADE"), index=True
     )
     teacher_id: Mapped[str] = mapped_column(
-        UUID_KEY,
-        ForeignKey("users.id", ondelete="CASCADE"), index=True
+        UUID_KEY, ForeignKey("users.id", ondelete="CASCADE"), index=True
     )
-    type: Mapped[AssignmentType] = mapped_column(
-        default=AssignmentType.OFFLINE, index=True
-    )
+    type: Mapped[AssignmentType] = mapped_column(default=AssignmentType.OFFLINE, index=True)
     title: Mapped[str] = mapped_column(String(255))
     description: Mapped[str] = mapped_column(Text, default="")
     subject: Mapped[str] = mapped_column(String(128))
@@ -67,13 +63,9 @@ class Assignment(UUID7PKMixin, TimestampMixin, Base):
     due_date: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
     auto_grade_on_due_date: Mapped[bool] = mapped_column(default=True)
     allow_late_submissions: Mapped[bool] = mapped_column(default=False)
-    auto_graded_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), index=True
-    )
+    auto_graded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
 
-    strictness_level: Mapped[StrictnessLevel] = mapped_column(
-        default=StrictnessLevel.MODERATE
-    )
+    strictness_level: Mapped[StrictnessLevel] = mapped_column(default=StrictnessLevel.MODERATE)
     grading_prompt: Mapped[str] = mapped_column(Text, default="")
     check_spelling: Mapped[bool] = mapped_column(default=True)
     check_grammar: Mapped[bool] = mapped_column(default=True)
@@ -91,32 +83,32 @@ class Assignment(UUID7PKMixin, TimestampMixin, Base):
     enable_tab_detection: Mapped[bool] = mapped_column(default=False)
     max_tab_switches: Mapped[int] = mapped_column(Integer, default=3)
 
-    school: Mapped["School"] = relationship()
-    teacher: Mapped["User"] = relationship(back_populates="assignments_created")
-    targets: Mapped[list["AssignmentTarget"]] = relationship(
+    school: Mapped[School] = relationship()
+    teacher: Mapped[User] = relationship(back_populates="assignments_created")
+    targets: Mapped[list[AssignmentTarget]] = relationship(
         back_populates="assignment",
         cascade="all, delete-orphan",
         lazy="selectin",
     )
-    questions: Mapped[list["Question"]] = relationship(
+    questions: Mapped[list[Question]] = relationship(
         back_populates="assignment",
         cascade="all, delete-orphan",
         order_by="Question.display_order",
         lazy="selectin",
     )
-    submissions: Mapped[list["Submission"]] = relationship(
+    submissions: Mapped[list[Submission]] = relationship(
         back_populates="assignment", cascade="all, delete-orphan"
     )
-    attempts: Mapped[list["AssessmentAttempt"]] = relationship(
+    attempts: Mapped[list[AssessmentAttempt]] = relationship(
         back_populates="assignment", cascade="all, delete-orphan"
     )
-    rubric_comments: Mapped[list["RubricComment"]] = relationship(
+    rubric_comments: Mapped[list[RubricComment]] = relationship(
         back_populates="assignment",
         cascade="all, delete-orphan",
         order_by="RubricComment.created_at",
         lazy="selectin",
     )
-    batch_tasks: Mapped[list["BatchGradingTask"]] = relationship(
+    batch_tasks: Mapped[list[BatchGradingTask]] = relationship(
         back_populates="assignment", cascade="all, delete-orphan"
     )
 
@@ -137,19 +129,15 @@ class AssignmentTarget(UUID7PKMixin, Base):
     __tablename__ = "assignment_targets"
 
     assignment_id: Mapped[str] = mapped_column(
-        UUID_KEY,
-        ForeignKey("assignments.id", ondelete="CASCADE"), index=True
+        UUID_KEY, ForeignKey("assignments.id", ondelete="CASCADE"), index=True
     )
     class_id: Mapped[str] = mapped_column(
-        UUID_KEY,
-        ForeignKey("classrooms.id", ondelete="CASCADE"), index=True
+        UUID_KEY, ForeignKey("classrooms.id", ondelete="CASCADE"), index=True
     )
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=utc_now
-    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
-    assignment: Mapped["Assignment"] = relationship(back_populates="targets")
-    classroom: Mapped["Classroom"] = relationship(
+    assignment: Mapped[Assignment] = relationship(back_populates="targets")
+    classroom: Mapped[Classroom] = relationship(
         back_populates="assignment_targets", lazy="selectin"
     )
 
@@ -171,8 +159,7 @@ class Question(UUID7PKMixin, TimestampMixin, Base):
     __tablename__ = "questions"
 
     assignment_id: Mapped[str] = mapped_column(
-        UUID_KEY,
-        ForeignKey("assignments.id", ondelete="CASCADE"), index=True
+        UUID_KEY, ForeignKey("assignments.id", ondelete="CASCADE"), index=True
     )
     type: Mapped[QuestionType] = mapped_column(default=QuestionType.MCQ_SINGLE)
     text: Mapped[str] = mapped_column(Text)
@@ -183,8 +170,8 @@ class Question(UUID7PKMixin, TimestampMixin, Base):
     min_char_length: Mapped[int | None] = mapped_column(Integer)
     max_char_length: Mapped[int | None] = mapped_column(Integer)
 
-    assignment: Mapped["Assignment"] = relationship(back_populates="questions")
-    options: Mapped[list["QuestionOption"]] = relationship(
+    assignment: Mapped[Assignment] = relationship(back_populates="questions")
+    options: Mapped[list[QuestionOption]] = relationship(
         back_populates="question",
         cascade="all, delete-orphan",
         order_by="QuestionOption.display_order",
@@ -205,14 +192,13 @@ class QuestionOption(UUID7PKMixin, Base):
     __tablename__ = "question_options"
 
     question_id: Mapped[str] = mapped_column(
-        UUID_KEY,
-        ForeignKey("questions.id", ondelete="CASCADE"), index=True
+        UUID_KEY, ForeignKey("questions.id", ondelete="CASCADE"), index=True
     )
     text: Mapped[str] = mapped_column(String(1024))
     is_correct: Mapped[bool] = mapped_column(default=False)
     display_order: Mapped[int] = mapped_column(Integer, default=0)
 
-    question: Mapped["Question"] = relationship(back_populates="options")
+    question: Mapped[Question] = relationship(back_populates="options")
 
 
 class RubricComment(UUID7PKMixin, Base):
@@ -227,17 +213,13 @@ class RubricComment(UUID7PKMixin, Base):
     __tablename__ = "rubric_comments"
 
     assignment_id: Mapped[str] = mapped_column(
-        UUID_KEY,
-        ForeignKey("assignments.id", ondelete="CASCADE"), index=True
+        UUID_KEY, ForeignKey("assignments.id", ondelete="CASCADE"), index=True
     )
     user_id: Mapped[str] = mapped_column(
-        UUID_KEY,
-        ForeignKey("users.id", ondelete="CASCADE"), index=True
+        UUID_KEY, ForeignKey("users.id", ondelete="CASCADE"), index=True
     )
     comment: Mapped[str] = mapped_column(Text)
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=utc_now
-    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
-    assignment: Mapped["Assignment"] = relationship(back_populates="rubric_comments")
-    author: Mapped["User"] = relationship(back_populates="rubric_comments", lazy="selectin")
+    assignment: Mapped[Assignment] = relationship(back_populates="rubric_comments")
+    author: Mapped[User] = relationship(back_populates="rubric_comments", lazy="selectin")

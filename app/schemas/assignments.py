@@ -64,6 +64,10 @@ class AssignmentResponse(BaseSchema):
     auto_grade_on_due_date: bool
     allow_late_submissions: bool
     auto_graded_at: datetime | None = None
+    state: str | None = None
+    submission_count: int = 0
+    my_submission: SubmissionResponse | None = None
+    my_attempt: AttemptSummary | None = None
     strictness_level: str
     grading_prompt: str = ""
     check_spelling: bool
@@ -340,6 +344,7 @@ class QuestionUpdate(BaseRequest):
     Attributes mirror :class:`QuestionCreate` (all optional).
     """
 
+    type: str | None = None
     text: str | None = None
     points: int | None = Field(default=None, ge=1)
     is_required: bool | None = None
@@ -407,3 +412,17 @@ class ReorderQuestionsRequest(BaseRequest):
     """
 
     question_ids: list[str] = Field(min_length=1)
+
+
+class AttemptSummary(BaseSchema):
+    """Answer-free assessment progress for a viewer or staff results list."""
+
+    id: IdStr
+    student_id: IdStr
+    status: str
+    score: float | None = None
+    max_score: float | None = None
+    grade_override: float | None = None
+    is_overridden: bool = False
+    submitted_at: datetime | None = None
+    student: UserSummary | None = None

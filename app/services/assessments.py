@@ -5,8 +5,9 @@ from dataclasses import dataclass
 from uuid import UUID
 
 from app.core.clock import Clock
-from app.core.errors import ConflictError, ForbiddenError, NotFoundError
+from app.core.errors import ConflictError, ForbiddenError, NotFoundError, ValidationFailedError
 from app.core.ids import IdProvider
+from app.core.pagination import Page, PageParams
 from app.core.security.principal import UserPrincipal
 from app.core.storage.base import ObjectStorage
 from app.core.storage.keys import snapshot_key
@@ -18,6 +19,7 @@ from app.repositories.assessments import (
     StudentAnswerRepository,
 )
 from app.repositories.assignments import AssignmentRepository, QuestionRepository
+from app.schemas.assessments import AttemptResponse
 from app.services.assignments import AssignmentService
 from app.services.grading.strategies import GradeOutcome, GradingStrategy
 
@@ -69,7 +71,7 @@ class AssessmentService:
         questions: QuestionRepository,
         assignments: AssignmentRepository,
         assignment_service: AssignmentService,
-        strategies: dict["QuestionType", GradingStrategy],
+        strategies: dict[QuestionType, GradingStrategy],
         storage: ObjectStorage,
         clock: Clock,
         ids: IdProvider,
@@ -99,9 +101,7 @@ class AssessmentService:
 
     # ── Lifecycle ────────────────────────────────────────────────────────
 
-    async def start(
-        self, principal: UserPrincipal, assignment_id: UUID
-    ) -> AttemptStart:
+    async def start(self, principal: UserPrincipal, assignment_id: UUID) -> AttemptStart:
         """Start or resume the student's attempt.
 
         Resumes an in-progress attempt; a terminated/timed-out attempt blocks
@@ -128,6 +128,10 @@ class AssessmentService:
         now = self._clock.now()
         attempt = await self._attempts.get_for_student(assignment_id, str(principal.id))
         if attempt is None:
+            from app.services.assignments import _aware
+
+            if now < _aware(assignment.start_date) or now > _aware(assignment.due_date):
+                raise ConflictError("The assessment window is closed.")
             created = await self._attempts.add(
                 AssessmentAttempt(
                     assignment_id=str(assignment.id),
@@ -137,9 +141,9 @@ class AssessmentService:
             )
             # Re-fetch so the answers collection is eager-loaded for
             # serialization (a flushed-new instance still lazy-loads).
-            attempt = await self._attempts.get_for_student(
-                assignment_id, str(principal.id)
-            ) or created
+            attempt = (
+                await self._attempts.get_for_student(assignment_id, str(principal.id)) or created
+            )
         elif not attempt.is_active:
             raise ConflictError(f"Attempt already {attempt.status.value.lower()}.")
 
@@ -242,9 +246,7 @@ class AssessmentService:
         await self._attempts.session.flush()
         return attempt, terminated
 
-    async def snapshot_url(
-        self, principal: UserPrincipal, assignment_id: UUID
-    ) -> tuple[str, str]:
+    async def snapshot_url(self, principal: UserPrincipal, assignment_id: UUID) -> tuple[str, str]:
         """Create an upload grant for a proctoring snapshot and log the key.
 
         Args:
@@ -301,9 +303,7 @@ class AssessmentService:
         ungraded = False
         for question in questions:
             max_score += question.points
-            answer = await self._answers.get_for_question(
-                str(attempt.id), str(question.id)
-            )
+            answer = await self._answers.get_for_question(str(attempt.id), str(question.id))
             if answer is None:
                 continue
             strategy = self._strategies.get(question.type)
@@ -325,24 +325,25 @@ class AssessmentService:
             attempt.submitted_at = now
         await self._attempts.session.flush()
 
-        percentage = (
-            None
-            if ungraded or max_score == 0
-            else round(score / max_score * 100, 1)
-        )
+        percentage = None if ungraded or max_score == 0 else round(score / max_score * 100, 1)
         return AttemptSubmit(
             attempt=attempt, score=score, max_score=max_score, percentage=percentage
         )
 
     async def grade_attempt(
-        self, principal: UserPrincipal, attempt_id: UUID, grade_override: float
+        self,
+        principal: UserPrincipal,
+        attempt_id: UUID,
+        grade_override: float | None,
+        question_overrides: dict[str, float] | None = None,
     ) -> AssessmentAttempt:
         """Teacher/admin override of an attempt's score.
 
         Args:
             principal: Authenticated staff caller.
             attempt_id: Attempt id.
-            grade_override: New score in points.
+            grade_override: New score in points, or None to clear.
+            question_overrides: Updated points indexed by question id.
 
         Returns:
             The updated attempt.
@@ -355,8 +356,36 @@ class AssessmentService:
         attempt = await self._attempts.get_by_id(attempt_id, principal.school_id)
         if attempt is None:
             raise NotFoundError("Attempt not found.")
+        await self._assignment_service.get_assignment(principal, UUID(str(attempt.assignment_id)))
+        if principal.role not in (UserRole.ADMIN.value, UserRole.TEACHER.value):
+            raise ForbiddenError("Staff access required.")
+        if attempt.is_active:
+            raise ConflictError("Finish the assessment before grading.")
+        questions = await self._questions.list_for_assignment(str(attempt.assignment_id))
+        by_id = {str(q.id): q for q in questions}
+        for question_id, points in (question_overrides or {}).items():
+            question = by_id.get(question_id)
+            if question is None or not 0 <= points <= question.points:
+                raise ValidationFailedError(
+                    "Question override is outside the permitted point range."
+                )
+        if grade_override is not None and not 0 <= grade_override <= sum(
+            q.points for q in questions
+        ):
+            raise ValidationFailedError("Overall override exceeds the assessment points.")
+        for question_id, points in (question_overrides or {}).items():
+            answer = await self._answers.get_for_question(str(attempt.id), question_id)
+            if answer is None:
+                answer = await self._answers.upsert(
+                    attempt_id=str(attempt.id), question_id=question_id, answer_data=None
+                )
+            answer.points_awarded = points
+            answer.is_correct = points == by_id[question_id].points
+        await self._answers.session.flush()
+        answers = await self._answers.list_for_attempt(str(attempt.id))
+        attempt.score = sum(a.points_awarded or 0 for a in answers)
         attempt.grade_override = grade_override
-        attempt.is_overridden = True
+        attempt.is_overridden = grade_override is not None
         await self._attempts.session.flush()
         return attempt
 
@@ -382,18 +411,54 @@ class AssessmentService:
         attempt = await self._attempts.get_by_id(attempt_id, principal.school_id)
         if attempt is None:
             raise NotFoundError("Attempt not found.")
-        if str(attempt.student_id) != str(principal.id):
-            raise ForbiddenError("You may only review your own attempt.")
+        await self._assignment_service.get_assignment(principal, UUID(str(attempt.assignment_id)))
+        if principal.role == UserRole.STUDENT.value:
+            if str(attempt.student_id) != str(principal.id):
+                raise ForbiddenError("You may only review your own attempt.")
+            if not attempt.assignment.show_results_after:
+                raise ForbiddenError("Results are not available yet.")
         if attempt.is_active:
             raise ConflictError("Finish the assessment before reviewing.")
-        questions = await self._questions.list_for_assignment(
-            str(attempt.assignment_id)
-        )
+        questions = await self._questions.list_for_assignment(str(attempt.assignment_id))
         return attempt, questions
 
-    async def get_assignment_for(
-        self, principal: UserPrincipal, assignment_id: UUID
-    ) -> Assignment:
+    def present_attempt(
+        self, attempt: AssessmentAttempt, principal: UserPrincipal
+    ) -> AttemptResponse:
+        """Respect result-release policy when projecting student attempt data."""
+        visible = principal.role != UserRole.STUDENT.value or attempt.assignment.show_results_after
+        return AttemptResponse.model_validate(attempt).model_copy(
+            update={
+                "score": attempt.effective_score if visible else None,
+                "grade_override": attempt.grade_override if visible else None,
+                "answers": [],
+                "proctoring_log": None,
+            }
+        )
+
+    async def list_attempts(
+        self, principal: UserPrincipal, assignment_id: UUID, params: PageParams
+    ) -> Page[AssessmentAttempt]:
+        """List visible assignment attempts, restricted to the student's own when applicable."""
+        await self._assignment_service.get_assignment(principal, assignment_id)
+        if principal.role == UserRole.STUDENT.value:
+            own = await self._attempts.get_for_student(assignment_id, str(principal.id))
+            return Page.of([own] if own and params.page == 1 else [], 1 if own else 0, params)
+        rows, total = await self._attempts.list_for_assignment(str(assignment_id), params)
+        return Page.of(rows, total, params)
+
+    async def review_snapshots(self, attempt: AssessmentAttempt) -> list[tuple[str, str]]:
+        """Resolve logged snapshot keys after the caller passed review authorization."""
+        results: list[tuple[str, str]] = []
+        entries = (attempt.proctoring_log or {}).get("snapshots", [])
+        if isinstance(entries, list):
+            for entry in entries:
+                if isinstance(entry, dict) and isinstance(entry.get("key"), str):
+                    grant = await self._storage.presign_get(entry["key"])
+                    results.append((grant.url, str(entry.get("timestamp", ""))))
+        return results
+
+    async def get_assignment_for(self, principal: UserPrincipal, assignment_id: UUID) -> Assignment:
         """Public passthrough for role-scoped assignment visibility.
 
         Args:
@@ -408,9 +473,7 @@ class AssessmentService:
         """
         return await self._assignment_service.get_assignment(principal, assignment_id)
 
-    def remaining_for(
-        self, assignment: Assignment, attempt: AssessmentAttempt
-    ) -> int:
+    def remaining_for(self, assignment: Assignment, attempt: AssessmentAttempt) -> int:
         """Public accessor for the attempt's remaining time budget.
 
         Args:
@@ -476,9 +539,7 @@ class AssessmentService:
         return attempt, False
 
     @staticmethod
-    def _remaining_seconds(
-        assignment: Assignment, attempt: AssessmentAttempt, now: object
-    ) -> int:
+    def _remaining_seconds(assignment: Assignment, attempt: AssessmentAttempt, now: object) -> int:
         """Compute seconds left on the attempt's time limit.
 
         Args:
@@ -489,18 +550,16 @@ class AssessmentService:
         Returns:
             Seconds remaining; a large value when no limit is set.
         """
-        if assignment.time_limit is None:
-            return 10**9
         from datetime import datetime as _dt
 
-        assert isinstance(now, _dt)
-        started = attempt.started_at
-        if started.tzinfo is None:
-            from datetime import UTC
+        from app.services.assignments import _aware
 
-            started = started.replace(tzinfo=UTC)
-        elapsed = (now - started).total_seconds()
-        return int(assignment.time_limit * 60 - elapsed)
+        assert isinstance(now, _dt)
+        window = int((_aware(assignment.due_date) - now).total_seconds())
+        if assignment.time_limit is None:
+            return window
+        elapsed = (now - _aware(attempt.started_at)).total_seconds()
+        return min(window, int(assignment.time_limit * 60 - elapsed))
 
     def _auto_timeout(
         self,
@@ -523,9 +582,7 @@ class AssessmentService:
             self._attempts.session.add(attempt)
 
     @staticmethod
-    def _prepare_questions(
-        assignment: Assignment, questions: list[Question]
-    ) -> list[Question]:
+    def _prepare_questions(assignment: Assignment, questions: list[Question]) -> list[Question]:
         """Build the exam-time question view (shuffled and sanitized).
 
         Persisted entities are never mutated: values are copied onto

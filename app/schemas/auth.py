@@ -86,7 +86,7 @@ class LoginResponse(BaseSchema):
     user: AuthUserResponse
     school: AuthSchoolResponse
     enable_logging: bool
-    tokens: TokenPair
+    tokens: TokenPair | None = None
 
 
 class RefreshRequest(BaseRequest):
@@ -119,6 +119,7 @@ class MeResponse(BaseSchema):
     email: str
     name: str
     role: str
+    avatar_url: str | None = None
     school_id: IdStr
     school_name: str | None = None
     school_primary_color: str | None = None

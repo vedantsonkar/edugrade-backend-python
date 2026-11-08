@@ -30,14 +30,13 @@ class Grade(UUID7PKMixin, TimestampMixin, Base):
     __tablename__ = "grades"
 
     school_id: Mapped[str] = mapped_column(
-        UUID_KEY,
-        ForeignKey("schools.id", ondelete="CASCADE"), index=True
+        UUID_KEY, ForeignKey("schools.id", ondelete="CASCADE"), index=True
     )
     name: Mapped[str] = mapped_column(String(100))
     display_order: Mapped[int] = mapped_column(Integer, default=0, index=True)
     is_custom: Mapped[bool] = mapped_column(default=False)
 
-    school: Mapped["School"] = relationship(lazy="selectin")
+    school: Mapped[School] = relationship(lazy="selectin")
 
 
 class Division(UUID7PKMixin, TimestampMixin, Base):
@@ -51,14 +50,11 @@ class Division(UUID7PKMixin, TimestampMixin, Base):
     __tablename__ = "divisions"
 
     school_id: Mapped[str] = mapped_column(
-        UUID_KEY,
-        ForeignKey("schools.id", ondelete="CASCADE"), index=True
+        UUID_KEY, ForeignKey("schools.id", ondelete="CASCADE"), index=True
     )
     name: Mapped[str] = mapped_column(String(100))
 
-    classrooms: Mapped[list["Classroom"]] = relationship(
-        back_populates="division"
-    )
+    classrooms: Mapped[list[Classroom]] = relationship(back_populates="division")
 
 
 class Classroom(UUID7PKMixin, TimestampMixin, Base):
@@ -75,27 +71,21 @@ class Classroom(UUID7PKMixin, TimestampMixin, Base):
     __tablename__ = "classrooms"
 
     school_id: Mapped[str] = mapped_column(
-        UUID_KEY,
-        ForeignKey("schools.id", ondelete="CASCADE"), index=True
+        UUID_KEY, ForeignKey("schools.id", ondelete="CASCADE"), index=True
     )
     grade_id: Mapped[str] = mapped_column(
-        UUID_KEY,
-        ForeignKey("grades.id", ondelete="CASCADE"), index=True
+        UUID_KEY, ForeignKey("grades.id", ondelete="CASCADE"), index=True
     )
     division_id: Mapped[str] = mapped_column(
-        UUID_KEY,
-        ForeignKey("divisions.id", ondelete="CASCADE"), index=True
+        UUID_KEY, ForeignKey("divisions.id", ondelete="CASCADE"), index=True
     )
     class_teacher_id: Mapped[str | None] = mapped_column(
-        UUID_KEY,
-        ForeignKey("users.id", ondelete="SET NULL"), index=True
+        UUID_KEY, ForeignKey("users.id", ondelete="SET NULL"), index=True
     )
     academic_year: Mapped[str] = mapped_column(String(16), index=True)
 
-    school: Mapped["School"] = relationship(back_populates="classrooms")
-    grade: Mapped["Grade"] = relationship(lazy="selectin")
-    division: Mapped["Division"] = relationship(lazy="selectin")
-    class_teacher: Mapped["User | None"] = relationship(lazy="selectin")
-    assignment_targets: Mapped[list["AssignmentTarget"]] = relationship(
-        back_populates="classroom"
-    )
+    school: Mapped[School] = relationship(back_populates="classrooms")
+    grade: Mapped[Grade] = relationship(lazy="selectin")
+    division: Mapped[Division] = relationship(lazy="selectin")
+    class_teacher: Mapped[User | None] = relationship(lazy="selectin")
+    assignment_targets: Mapped[list[AssignmentTarget]] = relationship(back_populates="classroom")

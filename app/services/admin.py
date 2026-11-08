@@ -92,6 +92,28 @@ class AdminStats:
     config: SchoolConfigResponse
 
 
+@dataclass(frozen=True)
+class TeacherCreated:
+    """Creation result carrying the initial password only to the creator."""
+
+    user: User
+    generated_password: str
+
+
+@dataclass(frozen=True)
+class CsvUserChange:
+    """Validated CSV row; no entity is changed during preview."""
+
+    existing: User | None
+    email: str
+    name: str
+    date_of_birth: datetime | None
+    password: str | None
+    grade_id: str | None
+    division_id: str | None
+    is_active: bool
+
+
 class AdminService:
     """School-scoped administration workflows (admin role enforced upstream)."""
 
@@ -199,9 +221,7 @@ class AdminService:
         """
         return await self._divisions.list_for_school(school_id)
 
-    async def create_division(
-        self, school_id: str, payload: DivisionCreate
-    ) -> Division:
+    async def create_division(self, school_id: str, payload: DivisionCreate) -> Division:
         """Create a division in the school.
 
         Args:
@@ -216,9 +236,7 @@ class AdminService:
         """
         if await self._divisions.name_exists(school_id, payload.name):
             raise ConflictError(f"Division '{payload.name}' already exists.")
-        return await self._divisions.add(
-            Division(school_id=school_id, name=payload.name)
-        )
+        return await self._divisions.add(Division(school_id=school_id, name=payload.name))
 
     async def delete_division(self, school_id: str, division_id: UUID) -> None:
         """Delete a division (classrooms cascade via FK).
@@ -248,9 +266,7 @@ class AdminService:
         """
         return await self._classrooms.list_for_school(school_id)
 
-    async def create_classroom(
-        self, school_id: str, payload: ClassroomCreate
-    ) -> Classroom:
+    async def create_classroom(self, school_id: str, payload: ClassroomCreate) -> Classroom:
         """Create a classroom from a (grade, division) pair.
 
         Args:
@@ -319,9 +335,7 @@ class AdminService:
                     or teacher.role != UserRole.TEACHER
                 ):
                     raise NotFoundError("Teacher not found.")
-            classroom.class_teacher_id = (
-                str(teacher_id) if teacher_id is not None else None
-            )
+            classroom.class_teacher_id = str(teacher_id) if teacher_id is not None else None
         await self._classrooms.session.flush()
         return classroom
 
@@ -365,9 +379,7 @@ class AdminService:
         rows, total = await self._users.paginate(stmt, params)
         return Page.of(rows, total, params)
 
-    async def create_student(
-        self, school_id: str, payload: StudentCreate
-    ) -> User:
+    async def create_student(self, school_id: str, payload: StudentCreate) -> User:
         """Create a student account.
 
         Password resolution order: explicit payload → date of birth → random
@@ -428,6 +440,19 @@ class AdminService:
             ConflictError: When the email is taken.
         """
         student = await self._require_user(school_id, student_id, UserRole.STUDENT)
+        for field, entity_id in [("grade", payload.grade_id), ("division", payload.division_id)]:
+            if entity_id is not None:
+                try:
+                    entity_uuid = UUID(entity_id)
+                except ValueError as exc:
+                    raise ValidationFailedError("Invalid grade or division id.") from exc
+                entity = (
+                    await self._grades.get(entity_uuid)
+                    if field == "grade"
+                    else await self._divisions.get(entity_uuid)
+                )
+                if entity is None or str(entity.school_id) != school_id:
+                    raise NotFoundError("Grade or division not found in this school.")
         fields = payload.model_dump(exclude_unset=True)
         if "email" in fields and fields["email"] is not None:
             new_email = str(fields["email"]).strip().lower()
@@ -475,9 +500,7 @@ class AdminService:
         rows, total = await self._users.paginate(stmt, params)
         return Page.of(rows, total, params)
 
-    async def create_teacher(
-        self, school_id: str, payload: TeacherCreate
-    ) -> User:
+    async def create_teacher(self, school_id: str, payload: TeacherCreate) -> TeacherCreated:
         """Create a teacher account.
 
         Args:
@@ -491,19 +514,27 @@ class AdminService:
             ConflictError: When the email is taken.
         """
         await self._ensure_email_free(payload.email)
-        password = payload.password or secrets.token_urlsafe(12)
-        return await self._users.add(
+        password = payload.password or (
+            "".join(payload.name.split()) + payload.date_of_birth.strftime("%Y%m%d")
+            if payload.date_of_birth
+            else secrets.token_urlsafe(12)
+        )
+        user = await self._users.add(
             User(
                 email=payload.email.strip().lower(),
                 name=payload.name.strip(),
                 role=UserRole.TEACHER,
+                classes_taught=[],
                 school_id=school_id,
+                date_of_birth=payload.date_of_birth,
                 password_hash=self._hasher.hash(password),
                 auth_method=AuthMethod.CREDENTIALS,
                 phone_country_code=payload.phone_country_code,
                 phone_number=payload.phone_number,
             )
         )
+
+        return TeacherCreated(user=user, generated_password=password)
 
     async def update_teacher(
         self, school_id: str, teacher_id: UUID, payload: TeacherUpdate
@@ -538,9 +569,7 @@ class AdminService:
         await self._users.session.flush()
         return teacher
 
-    async def set_user_status(
-        self, school_id: str, user_id: UUID, is_active: bool
-    ) -> User:
+    async def set_user_status(self, school_id: str, user_id: UUID, is_active: bool) -> User:
         """Activate or deactivate any user in the school.
 
         Args:
@@ -563,130 +592,152 @@ class AdminService:
 
     # ── Bulk CSV ─────────────────────────────────────────────────────────
 
-    async def bulk_import_users(  # noqa: PLR0912, PLR0915 - CSV row pipeline
-        self, school_id: str, csv_content: str, *, dry_run: bool, role: UserRole
+    async def bulk_import_users(  # noqa: PLR0912, PLR0915 - validate all rows before mutation
+        self,
+        school_id: str,
+        csv_content: str,
+        *,
+        dry_run: bool,
+        role: UserRole,
+        operation: str = "upsert",
+        skip_invalid: bool = True,
     ) -> BulkUserCsvResponse:
-        """Import users from CSV (create or update by email).
+        """Validate a complete CSV before applying tenant-scoped user changes.
 
-        Expected columns: ``email,name`` plus ``grade_name,division_name`` for
-        students. Rows update matching emails, create the rest.
-
-        Args:
-            school_id: Tenant.
-            csv_content: Raw CSV text with a header row.
-            dry_run: Validate only; persist nothing.
-            role: Role assigned to created users.
-
-        Returns:
-            Aggregate outcome with per-row errors.
+        Dry runs never modify loaded ORM entities. Invalid files are atomic unless
+        the administrator explicitly chooses to skip invalid rows.
 
         Raises:
-            ValidationFailedError: When the CSV is unreadable or headerless.
+            ValidationFailedError: If the operation or CSV header is invalid.
         """
-        created = updated = skipped = 0
+        from datetime import UTC, datetime
+
+        if operation not in {"upsert", "create", "update", "status"}:
+            raise ValidationFailedError("Unknown CSV operation.")
+        reader = csv.DictReader(io.StringIO(csv_content.lstrip("\ufeff")))
+        if reader.fieldnames is None:
+            raise ValidationFailedError("CSV must include a header row.")
+        reader.fieldnames = [h.strip().lower() for h in reader.fieldnames]
+        if "email" not in reader.fieldnames:
+            raise ValidationFailedError("CSV requires an email column.")
+        grades = {g.name.lower(): g for g in await self._grades.list_for_school(school_id)}
+        divisions = {d.name.lower(): d for d in await self._divisions.list_for_school(school_id)}
+        changes: list[CsvUserChange] = []
         errors: list[BulkUserRowResult] = []
-        try:
-            reader = csv.DictReader(io.StringIO(csv_content))
-            if reader.fieldnames is None:
-                raise ValidationFailedError("CSV must include a header row.")
-            headers = [h.strip().lower() for h in reader.fieldnames]
-            if "email" not in headers or "name" not in headers:
-                raise ValidationFailedError("CSV requires 'email' and 'name' columns.")
-
-            grade_names = {g.name.lower(): g for g in await self._grades.list_for_school(school_id)}
-            division_names = {
-                d.name.lower(): d for d in await self._divisions.list_for_school(school_id)
-            }
-
-            for index, row in enumerate(reader, start=2):
-                email = (row.get("email") or "").strip().lower()
-                name = (row.get("name") or "").strip()
-                if not email or not name:
-                    errors.append(
-                        BulkUserRowResult(row=index, email=email or "-", status="error",
-                                          message="email and name are required.")
+        seen: set[str] = set()
+        total = 0
+        for index, row in enumerate(reader, start=2):
+            total += 1
+            email = (row.get("email") or "").strip().lower()
+            name = (row.get("name") or "").strip()
+            existing = await self._users.get_by_email(email)
+            message = ""
+            if "@" not in email or email in seen:
+                message = "Invalid or duplicate email."
+            elif existing and (str(existing.school_id) != school_id or existing.role != role):
+                message = "Account is not available in this school and role."
+            elif operation == "create" and existing:
+                message = "Account already exists."
+            elif operation in {"update", "status"} and not existing:
+                message = "Account does not exist."
+            elif not existing and not name:
+                message = "Name is required."
+            seen.add(email)
+            dob_raw = (row.get("dob") or row.get("date_of_birth") or "").strip()
+            dob = None
+            if dob_raw:
+                try:
+                    dob = datetime.strptime(dob_raw, "%Y-%m-%d").replace(tzinfo=UTC)
+                except ValueError:
+                    message = "Date of birth must be YYYY-MM-DD."
+            grade_raw = (row.get("grade") or row.get("grade_name") or "").strip().lower()
+            division_raw = (row.get("division") or row.get("division_name") or "").strip().lower()
+            grade = grades.get(grade_raw)
+            division = divisions.get(division_raw)
+            if role == UserRole.STUDENT and grade_raw and grade is None:
+                message = "Unknown grade."
+            if role == UserRole.STUDENT and division_raw and division is None:
+                message = "Unknown division."
+            active_raw = (row.get("isactive") or "").strip().lower()
+            if operation == "status" and active_raw not in {"true", "false"}:
+                message = "isActive must be true or false."
+            password = (row.get("password") or "").strip()
+            if not existing and not password and dob is None:
+                message = "Provide a password or date of birth."
+            if message:
+                errors.append(
+                    BulkUserRowResult(row=index, email=email, status="error", message=message)
+                )
+                continue
+            changes.append(
+                CsvUserChange(
+                    existing=existing,
+                    email=email,
+                    name=name,
+                    date_of_birth=dob,
+                    password=password or None,
+                    grade_id=str(grade.id) if grade else None,
+                    division_id=str(division.id) if division else None,
+                    is_active=active_raw == "true",
+                )
+            )
+        can_apply = not dry_run and (not errors or skip_invalid)
+        created = sum(change.existing is None for change in changes)
+        updated = len(changes) - created
+        if can_apply:
+            for change in changes:
+                user = change.existing
+                if user is None:
+                    password = change.password or (
+                        "".join(change.name.split()) + change.date_of_birth.strftime("%Y%m%d")
+                        if change.date_of_birth
+                        else secrets.token_urlsafe(16)
                     )
-                    continue
-                existing = await self._users.get_by_email(email)
-                if existing is not None:
-                    if existing.role != role:
-                        errors.append(
-                            BulkUserRowResult(
-                                row=index, email=email, status="error",
-                                message=f"email belongs to a "
-                                        f"{existing.role.value.lower()}.",
-                            )
+                    await self._users.add(
+                        User(
+                            email=change.email,
+                            name=change.name,
+                            role=role,
+                            school_id=school_id,
+                            grade_id=change.grade_id,
+                            division_id=change.division_id,
+                            date_of_birth=change.date_of_birth,
+                            password_hash=self._hasher.hash(password),
+                            auth_method=AuthMethod.CREDENTIALS,
                         )
-                        continue
-                    existing.name = name
-                    updated += 1
-                    continue
-                if role is UserRole.STUDENT:
-                    grade_name = (row.get("grade_name") or "").strip().lower()
-                    division_name = (row.get("division_name") or "").strip().lower()
-                    grade = grade_names.get(grade_name)
-                    division = division_names.get(division_name)
-                    if grade is None:
-                        errors.append(
-                            BulkUserRowResult(row=index, email=email, status="error",
-                                              message=f"unknown grade '{grade_name}'.")
-                        )
-                        continue
-                    dob_raw = (row.get("date_of_birth") or "").strip()
-                    date_of_birth = None
-                    if dob_raw:
-                        try:
-                            from datetime import datetime as _dt
-
-                            date_of_birth = _dt.strptime(dob_raw, "%Y-%m-%d")
-                        except ValueError:
-                            errors.append(
-                                BulkUserRowResult(row=index, email=email, status="error",
-                                                  message="date_of_birth must be YYYY-MM-DD.")
-                            )
-                            continue
-                    if not dry_run:
-                        await self._users.add(
-                            User(
-                                email=email,
-                                name=name,
-                                role=UserRole.STUDENT,
-                                school_id=school_id,
-                                grade_id=str(grade.id),
-                                division_id=str(division.id) if division else None,
-                                date_of_birth=date_of_birth,
-                                password_hash=(
-                                    self._hasher.hash(dob_raw.replace("-", ""))
-                                    if dob_raw
-                                    else self._hasher.hash(secrets.token_urlsafe(12))
-                                ),
-                                auth_method=AuthMethod.CREDENTIALS,
-                            )
-                        )
-                    created += 1
+                    )
+                elif operation == "status":
+                    user.is_active = change.is_active
                 else:
-                    if not dry_run:
-                        await self._users.add(
-                            User(
-                                email=email,
-                                name=name,
-                                role=UserRole.TEACHER,
-                                school_id=school_id,
-                                password_hash=self._hasher.hash(secrets.token_urlsafe(12)),
-                                auth_method=AuthMethod.CREDENTIALS,
-                            )
-                        )
-                    created += 1
-        except csv.Error as exc:
-            raise ValidationFailedError(f"CSV parse error: {exc}") from exc
-
-        if not dry_run:
+                    if change.name:
+                        user.name = change.name
+                    if change.date_of_birth:
+                        user.date_of_birth = change.date_of_birth
+                    if change.grade_id:
+                        user.grade_id = change.grade_id
+                    if change.division_id:
+                        user.division_id = change.division_id
+                    if change.password:
+                        user.password_hash = self._hasher.hash(change.password)
             await self._session.flush()
-        if errors:
-            skipped = len(errors)
-        return BulkUserCsvResponse(created=created, updated=updated, skipped=skipped, errors=errors)
+        return BulkUserCsvResponse(
+            created=created if dry_run or can_apply else 0,
+            updated=updated if dry_run or can_apply else 0,
+            skipped=len(errors),
+            errors=errors,
+            valid=not errors,
+            total_rows=total,
+            valid_rows=len(changes),
+            invalid_rows=len(errors),
+        )
 
-    # ── Aggregated payloads ──────────────────────────────────────────────
+    async def user_counts(self, school_id: str, role: str) -> tuple[int, int]:
+        """Read activation counts for a validated role in the caller's school."""
+        try:
+            selected = UserRole(role)
+        except ValueError as exc:
+            raise ValidationFailedError("Unknown user role.") from exc
+        return await self._users.activation_counts(school_id, selected)
 
     async def class_teachers_payload(self, school: School) -> ClassTeachersPayload:
         """Aggregate the class-teacher screen's initial payload.
@@ -700,7 +751,8 @@ class AdminService:
         school_id = str(school.id)
         config = school.config
         return ClassTeachersPayload(
-            config=SchoolConfigResponse.model_validate(config) if config
+            config=SchoolConfigResponse.model_validate(config)
+            if config
             else SchoolConfigResponse(
                 allow_multiple_class_teachers=False,
                 enable_logging=False,
@@ -750,7 +802,9 @@ class AdminService:
             total_classes=await self._classrooms.count_for_school(school_id),
             total_assignments=await self._assignments.count_for_school(school_id),
             classes_without_teacher=await self._classrooms.count_without_teacher(school_id),
-            config=SchoolConfigResponse.model_validate(config) if config else SchoolConfigResponse(
+            config=SchoolConfigResponse.model_validate(config)
+            if config
+            else SchoolConfigResponse(
                 allow_multiple_class_teachers=False,
                 enable_logging=False,
                 enable_vision_ocr=True,
@@ -772,9 +826,7 @@ class AdminService:
         if await self._users.get_by_email(email) is not None:
             raise ConflictError("A user with this email already exists.")
 
-    async def _require_user(
-        self, school_id: str, user_id: UUID, role: UserRole
-    ) -> User:
+    async def _require_user(self, school_id: str, user_id: UUID, role: UserRole) -> User:
         """Fetch a user of a role enforced to the school.
 
         Args:

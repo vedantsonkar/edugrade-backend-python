@@ -12,6 +12,7 @@ from app.schemas.assessments import (
     AttemptGradeRequest,
     AttemptResponse,
     ReviewResponse,
+    ReviewSnapshot,
     StudentAnswerResponse,
 )
 from app.schemas.assignments import QuestionResponse
@@ -49,7 +50,7 @@ async def override_grade(
     if current_user.role not in ("TEACHER", "ADMIN"):
         raise ForbiddenError("Teacher or administrator role required.")
     attempt = await service.grade_attempt(
-        current_user, attempt_id, payload.grade_override
+        current_user, attempt_id, payload.grade_override, payload.question_overrides
     )
     return AttemptResponse.model_validate(attempt)
 
@@ -80,6 +81,10 @@ async def review(
     """
     attempt, questions = await service.review(current_user, attempt_id)
     return ReviewResponse(
+        snapshots=[
+            ReviewSnapshot(url=url, timestamp=timestamp)
+            for url, timestamp in await service.review_snapshots(attempt)
+        ],
         attempt=AttemptResponse.model_validate(attempt),
         questions=[QuestionResponse.model_validate(q) for q in questions],
         answers=[StudentAnswerResponse.model_validate(a) for a in attempt.answers],

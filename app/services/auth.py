@@ -129,9 +129,7 @@ class AuthService:
             raise UnauthorizedError("Invalid email or password.")
         if not user.is_active:
             raise UnauthorizedError("This account has been deactivated.")
-        if user.password_hash is None or not self._hasher.verify(
-            password, user.password_hash
-        ):
+        if user.password_hash is None or not self._hasher.verify(password, user.password_hash):
             raise UnauthorizedError("Invalid email or password.")
 
         if school_id is not None and str(user.school_id) != school_id:
@@ -139,6 +137,8 @@ class AuthService:
         if login_type == "admin" and user.role.value == "STUDENT":
             raise ForbiddenError("Students must sign in from the student portal.")
 
+        if login_type == "student" and user.role.value != "STUDENT":
+            raise ForbiddenError("Staff must sign in from the staff portal.")
         school = user.school
         if school is None:
             raise NotFoundError("User's school could not be loaded.")
@@ -234,9 +234,7 @@ class AuthService:
             raise UnauthorizedError("Account is unavailable.")
         return user
 
-    async def _issue(
-        self, user: User, school: School, enable_logging: bool
-    ) -> LoginResult:
+    async def _issue(self, user: User, school: School, enable_logging: bool) -> LoginResult:
         """Issue an access/refresh pair and persist the refresh row.
 
         Args:

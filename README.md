@@ -54,13 +54,22 @@ docker compose exec api python scripts/seed.py
 make install      # venv + deps (requires Python 3.13+)
 make dev          # uvicorn --reload (needs postgres/redis/seaweedfs, see compose)
 make upgrade      # alembic upgrade head
-make seed         # demo school + admin/teacher/students + a quiz
+make seed         # two isolated demo schools, each with users and a quiz
 make lint typecheck test   # quality gates (CI parity)
 ```
 
-Seeded logins: `admin@demo-school.edu / Admin@123`,
-`teacher@demo-school.edu / Teacher@123`,
-`student1@demo-school.edu / 20090101` (subdomain `demo-school`).
+Seeding creates `demo-school` (Demo Academy) and `demo-school-2` (Demo Academy 2).
+Each has an admin, teacher, two students, separate taxonomy/classroom IDs, and its
+own quiz. Existing schools are skipped independently without resetting passwords.
+
+| Subdomain | Admin-tab key | Admin | Teacher | Students |
+| --- | --- | --- | --- | --- |
+| `demo-school` | `demo-admin-key` | `admin@demo-school.edu` | `teacher@demo-school.edu` | `student1@demo-school.edu`, `student2@demo-school.edu` |
+| `demo-school-2` | `demo-admin-key-2` | `admin@demo-school-2.edu` | `teacher@demo-school-2.edu` | `student1@demo-school-2.edu`, `student2@demo-school-2.edu` |
+
+Passwords in both schools: admin `Admin@123`, teacher `Teacher@123`, student1
+`20090101`, student2 `20090102`. Teachers use the Admin tab. See
+[Test Credentials.md](<Test Credentials.md>) for login and isolation demonstrations.
 
 ## API surface (summary)
 
@@ -88,3 +97,7 @@ Read **[AGENTS.md](AGENTS.md)** before contributing — it defines the SOLID
 mapping, docstring requirements (Google style, enforced by ruff `D`), and the
 strict-typing policy (`mypy --strict`, `Any` banned). PRs must keep
 `make lint typecheck test` green.
+
+## Frontend integration
+
+See [frontend integration](docs/frontend-integration.md) for gateway authentication, added API contracts, browser storage configuration, local startup, and verification. The current project requires Python 3.14, as declared in pyproject.toml.

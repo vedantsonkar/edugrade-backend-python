@@ -5,6 +5,7 @@ from uuid import UUID
 
 from app.core.errors import ConflictError, ForbiddenError, NotFoundError
 from app.core.security.principal import UserPrincipal
+from app.core.storage.base import ObjectStorage
 from app.domain.schools import School, SchoolConfig
 from app.repositories.schools import SchoolConfigRepository, SchoolRepository
 from app.schemas.school import SchoolSettingsUpdate
@@ -17,15 +18,18 @@ class SchoolService:
         self,
         schools: SchoolRepository,
         configs: SchoolConfigRepository,
+        storage: ObjectStorage,
     ) -> None:
         """Inject repositories.
 
         Args:
             schools: School repository.
             configs: School-config repository.
+            storage: Object storage signing port.
         """
         self._schools = schools
         self._configs = configs
+        self._storage = storage
 
     async def get_public_branding(self, subdomain: str) -> School:
         """Resolve a school for the unauthenticated login page.
@@ -43,6 +47,13 @@ class SchoolService:
         if school is None:
             raise NotFoundError("School not found.")
         return school
+
+    async def public_logo(self, school: School) -> str | None:
+        """Resolve the logo already bound to a publicly visible school."""
+        if not school.logo_url or school.logo_url.startswith(("https://", "http://")):
+            return school.logo_url
+        grant = await self._storage.presign_get(school.logo_url)
+        return grant.url
 
     async def validate_admin_key(
         self,
@@ -112,9 +123,7 @@ class SchoolService:
             raise NotFoundError("School not found.")
         return school
 
-    async def update_settings(
-        self, school_id: str, updates: SchoolSettingsUpdate
-    ) -> School:
+    async def update_settings(self, school_id: str, updates: SchoolSettingsUpdate) -> School:
         """Apply a partial settings update to school + config.
 
         Args:
@@ -132,12 +141,24 @@ class SchoolService:
 
         data = updates.model_dump(exclude_unset=True, by_alias=False)
         school_fields = {
-            "name", "subdomain", "primary_color", "logo_url", "phone_country_code",
-            "phone_number", "address", "city", "state", "country", "postal_code",
-            "default_locale", "timezone",
+            "name",
+            "subdomain",
+            "primary_color",
+            "logo_url",
+            "phone_country_code",
+            "phone_number",
+            "address",
+            "city",
+            "state",
+            "country",
+            "postal_code",
+            "default_locale",
+            "timezone",
         }
         config_fields = {
-            "allow_multiple_class_teachers", "enable_logging", "enable_vision_ocr",
+            "allow_multiple_class_teachers",
+            "enable_logging",
+            "enable_vision_ocr",
             "current_academic_year",
         }
 
@@ -149,8 +170,15 @@ class SchoolService:
                     raise ConflictError("Subdomain is already in use.")
                 school.subdomain = new_subdomain
 
+        logo = data.get("logo_url")
+        if (
+            isinstance(logo, str)
+            and logo
+            and not logo.startswith(("http://", "https://", f"uploads/{school_id}/"))
+        ):
+            raise ForbiddenError("Logo must belong to this school.")
         for key, value in data.items():
-            if key in school_fields and value is not None:
+            if key in school_fields and (value is not None or key == "logo_url"):
                 setattr(school, key, value)
 
         if any(key in config_fields for key in data):
