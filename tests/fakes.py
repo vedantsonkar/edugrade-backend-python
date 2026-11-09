@@ -8,6 +8,7 @@ import time
 from dataclasses import dataclass, field
 from uuid import UUID
 
+import jwt
 from app.core.ids import Uuid7Provider
 from app.core.ratelimit.base import RateLimitResult
 from app.core.security.tokens import (
@@ -117,17 +118,21 @@ class FakeTokenService:
             Claims mapping.
 
         Raises:
-            ValueError: On unknown/expired/type-mismatched tokens.
+            jwt.InvalidTokenError: On unknown/expired/type-mismatched tokens
+                (mirroring the real service's contract for guards).
         """
         import base64
         import json
 
-        payload_part = token.split(".", 1)[1]
-        claims: dict[str, object] = json.loads(base64.b64decode(payload_part))
+        try:
+            payload_part = token.split(".", 1)[1]
+            claims: dict[str, object] = json.loads(base64.b64decode(payload_part + "=="))
+        except (IndexError, ValueError) as exc:
+            raise jwt.InvalidTokenError("malformed fake token") from exc
         if claims.get("typ") != expected_type:
-            raise ValueError("type mismatch")
+            raise jwt.InvalidTokenError("type mismatch")
         if float(claims["exp"]) <= self._clock._current:
-            raise ValueError("expired")
+            raise jwt.InvalidTokenError("expired")
         return claims
 
 

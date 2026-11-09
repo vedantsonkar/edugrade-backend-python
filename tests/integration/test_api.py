@@ -6,27 +6,34 @@ sanitization, the assessment attempt workflow, submissions, and files.
 """
 
 
+import pytest
 from app.core.db.engine import session_scope
 from app.domain.enums import UserRole
 from fastapi.testclient import TestClient
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 
-def _login(client: TestClient, email: str, password: str) -> dict[str, object]:
+def _login(
+    client: TestClient,
+    email: str,
+    password: str,
+    admin_key: str | None = None,
+) -> dict[str, object]:
     """Login via the API and return the JSON body.
 
     Args:
         client: Test client.
         email: Account email.
         password: Password.
+        admin_key: School admin key (required for staff accounts).
 
     Returns:
         Response payload.
     """
-    response = client.post(
-        "/api/v1/auth/login",
-        json={"email": email, "password": password},
-    )
+    payload: dict[str, object] = {"email": email, "password": password}
+    if admin_key is not None:
+        payload["adminKey"] = admin_key
+    response = client.post("/api/v1/auth/login", json=payload)
     assert response.status_code == 200, response.text
     return response.json()
 
@@ -85,6 +92,48 @@ class TestAuthFlow:
         assert response.status_code == 401
         assert response.json()["error"]["code"] == "UNAUTHORIZED"
 
+    @pytest.mark.parametrize(
+        ("email", "password"),
+        [("teacher@test.edu", "Teacher@123"), ("admin@test.edu", "Admin@123")],
+    )
+    def test_staff_login_without_admin_key_403(
+        self,
+        client: TestClient,
+        seeded_ids: dict[str, str],
+        email: str,
+        password: str,
+    ) -> None:
+        """Staff credentials alone never authenticate, even without a portal hint."""
+        response = client.post(
+            "/api/v1/auth/login",
+            json={"email": email, "password": password},
+        )
+        assert response.status_code == 403
+        assert response.json()["error"]["code"] == "FORBIDDEN"
+
+    def test_staff_login_with_wrong_admin_key_403(
+        self, client: TestClient, seeded_ids: dict[str, str]
+    ) -> None:
+        """A mismatched admin key is rejected despite valid staff credentials."""
+        response = client.post(
+            "/api/v1/auth/login",
+            json={
+                "email": "teacher@test.edu",
+                "password": "Teacher@123",
+                "loginType": "admin",
+                "adminKey": "wrong-key",
+            },
+        )
+        assert response.status_code == 403
+        assert response.json()["error"]["code"] == "FORBIDDEN"
+
+    def test_staff_login_with_admin_key_succeeds(
+        self, client: TestClient, seeded_ids: dict[str, str]
+    ) -> None:
+        """Teacher login succeeds when the school admin key matches."""
+        body = _login(client, "teacher@test.edu", "Teacher@123", admin_key="test-admin-key")
+        assert body["user"]["role"] == "TEACHER"
+
     def test_anonymous_me_401(self, client: TestClient) -> None:
         """/me without credentials returns 401."""
         assert client.get("/api/v1/auth/me").status_code == 401
@@ -93,7 +142,7 @@ class TestAuthFlow:
         self, client: TestClient, seeded_ids: dict[str, str]
     ) -> None:
         """Authorization: Bearer works as an alternative to cookies."""
-        body = _login(client, "teacher@test.edu", "Teacher@123")
+        body = _login(client, "teacher@test.edu", "Teacher@123", admin_key="test-admin-key")
         token = body["tokens"]["accessToken"]
         me = client.get(
             "/api/v1/auth/me", headers={"Authorization": f"Bearer {token}"}
@@ -154,7 +203,7 @@ class TestAdminModule:
         self, client: TestClient, seeded_ids: dict[str, str]
     ) -> None:
         """Grades create/list/delete; duplicate names conflict."""
-        _login(client, "admin@test.edu", "Admin@123")
+        _login(client, "admin@test.edu", "Admin@123", admin_key="test-admin-key")
         created = client.post("/api/v1/admin/grades", json={"name": "Grade 11"})
         assert created.status_code == 200
         duplicate = client.post("/api/v1/admin/grades", json={"name": "grade 11"})
@@ -183,7 +232,7 @@ class TestAdminModule:
                         division_id=seeded_ids["division"],
                     )
                 )
-        _login(client, "admin@test.edu", "Admin@123")
+        _login(client, "admin@test.edu", "Admin@123", admin_key="test-admin-key")
         page1 = client.get("/api/v1/admin/students?pageSize=10&page=1")
         assert page1.status_code == 200
         body = page1.json()
@@ -213,7 +262,7 @@ class TestAdminModule:
         self, client: TestClient, seeded_ids: dict[str, str]
     ) -> None:
         """Admin can assign and clear a classroom teacher."""
-        _login(client, "admin@test.edu", "Admin@123")
+        _login(client, "admin@test.edu", "Admin@123", admin_key="test-admin-key")
         updated = client.patch(
             f"/api/v1/admin/classes/{seeded_ids['class']}",
             json={"classTeacherId": seeded_ids["teacher"]},
@@ -231,7 +280,7 @@ class TestAdminModule:
         self, client: TestClient, seeded_ids: dict[str, str]
     ) -> None:
         """Dashboard stats aggregate counts."""
-        _login(client, "admin@test.edu", "Admin@123")
+        _login(client, "admin@test.edu", "Admin@123", admin_key="test-admin-key")
         response = client.get("/api/v1/admin/stats")
         assert response.status_code == 200
         body = response.json()
@@ -274,7 +323,7 @@ class TestAssignments:
         self, client: TestClient, seeded_ids: dict[str, str]
     ) -> None:
         """Teachers create; targeted students see it; others don't."""
-        _login(client, "teacher@test.edu", "Teacher@123")
+        _login(client, "teacher@test.edu", "Teacher@123", admin_key="test-admin-key")
         assignment = self._create_assignment(client, seeded_ids)
 
         _login(client, "student@test.edu", "Student@123")
@@ -287,7 +336,7 @@ class TestAssignments:
         self, client: TestClient, seeded_ids: dict[str, str]
     ) -> None:
         """Student question reads never carry isCorrect/explanations."""
-        _login(client, "teacher@test.edu", "Teacher@123")
+        _login(client, "teacher@test.edu", "Teacher@123", admin_key="test-admin-key")
         assignment = self._create_assignment(client, seeded_ids)
         created = client.post(
             f"/api/v1/assignments/{assignment['id']}/questions",
@@ -318,7 +367,7 @@ class TestAssignments:
         self, client: TestClient, seeded_ids: dict[str, str]
     ) -> None:
         """Start → answer → submit grades the MCQ and returns aggregates."""
-        _login(client, "teacher@test.edu", "Teacher@123")
+        _login(client, "teacher@test.edu", "Teacher@123", admin_key="test-admin-key")
         assignment = self._create_assignment(client, seeded_ids)
         created = client.post(
             f"/api/v1/assignments/{assignment['id']}/questions",
@@ -364,7 +413,7 @@ class TestAssignments:
         self, client: TestClient, seeded_ids: dict[str, str]
     ) -> None:
         """Exceeding the switch allowance terminates the attempt."""
-        _login(client, "teacher@test.edu", "Teacher@123")
+        _login(client, "teacher@test.edu", "Teacher@123", admin_key="test-admin-key")
         assignment = self._create_assignment(client, seeded_ids)
         client.patch(
             f"/api/v1/assignments/{assignment['id']}",
@@ -381,7 +430,7 @@ class TestAssignments:
         self, client: TestClient, seeded_ids: dict[str, str]
     ) -> None:
         """Student submits; teacher lists and overrides the grade."""
-        _login(client, "teacher@test.edu", "Teacher@123")
+        _login(client, "teacher@test.edu", "Teacher@123", admin_key="test-admin-key")
         offline = client.post(
             "/api/v1/assignments",
             json={
@@ -414,7 +463,7 @@ class TestAssignments:
         )
         assert submitted.status_code == 200, submitted.text
 
-        _login(client, "teacher@test.edu", "Teacher@123")
+        _login(client, "teacher@test.edu", "Teacher@123", admin_key="test-admin-key")
         listed = client.get(f"/api/v1/assignments/{assignment_id}/submissions")
         assert listed.status_code == 200
         assert listed.json()["total"] == 1
@@ -432,7 +481,7 @@ class TestAssignments:
         self, client: TestClient, seeded_ids: dict[str, str]
     ) -> None:
         """Both teacher and student participate in the thread."""
-        _login(client, "teacher@test.edu", "Teacher@123")
+        _login(client, "teacher@test.edu", "Teacher@123", admin_key="test-admin-key")
         assignment = self._create_assignment(client, seeded_ids)
         posted = client.post(
             f"/api/v1/assignments/{assignment['id']}/comments",

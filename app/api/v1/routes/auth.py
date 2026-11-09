@@ -153,6 +153,7 @@ async def login(
         password=payload.password,
         school_id=payload.school_id,
         login_type=payload.login_type,
+        admin_key=payload.admin_key,
     )
     _set_cookies(response, container, result.access_token, result.refresh.token)
     return _to_login_response(

@@ -15,12 +15,15 @@ class LoginRequest(BaseRequest):
             belong to that school.
         login_type: Optional client tab context (``student``/``admin``);
             ``admin`` rejects student accounts (staff-only login screen).
+        admin_key: Optional school admin key; required whenever the account
+            resolves to a staff role (teacher/admin).
     """
 
     email: str = Field(min_length=3, max_length=255)
     password: str = Field(min_length=1, max_length=1024)
     school_id: IdStr | None = None
     login_type: str | None = None
+    admin_key: str | None = Field(default=None, min_length=1, max_length=255)
 
 
 class TokenPair(BaseSchema):

@@ -5,6 +5,7 @@ issuance, and refresh-token lifecycle decisions are made. HTTP mechanics
 (cookies, status codes) live in the auth routes.
 """
 
+import hmac
 import logging
 from dataclasses import dataclass
 from uuid import UUID
@@ -68,6 +69,8 @@ class AuthService:
     Business rules:
       - accounts must be active and permit credentials login;
       - ``login_type="admin"`` rejects students (staff-only portal);
+      - staff accounts (teacher/admin) additionally require the school's
+        admin key, regardless of the client-supplied portal context;
       - optional ``school_id`` must match the user's school;
       - refresh tokens are single-use: consuming one revokes it and issues a
         successor (rotation); logout revokes the presented token.
@@ -106,6 +109,7 @@ class AuthService:
         password: str,
         school_id: str | None,
         login_type: str | None,
+        admin_key: str | None = None,
     ) -> LoginResult:
         """Authenticate with email + password.
 
@@ -114,6 +118,8 @@ class AuthService:
             password: Plaintext password.
             school_id: Optional expected school id.
             login_type: Optional ``student``/``admin`` portal context.
+            admin_key: Optional school admin key; mandatory for staff roles
+                (teacher/admin) regardless of ``login_type``.
 
         Returns:
             Login result with fresh tokens.
@@ -121,7 +127,8 @@ class AuthService:
         Raises:
             UnauthorizedError: On unknown email, bad password, deactivated
                 account, or credentials login not permitted.
-            ForbiddenError: When a student attempts the admin portal.
+            ForbiddenError: When a student attempts the admin portal, or a
+                staff account logs in without a matching admin key.
             ConflictError: When the school context mismatches.
         """
         user = await self._users.get_by_email(email.strip())
@@ -142,6 +149,13 @@ class AuthService:
         school = user.school
         if school is None:
             raise NotFoundError("User's school could not be loaded.")
+
+        if user.role.value != "STUDENT":
+            if not admin_key:
+                raise ForbiddenError("Staff login requires the school admin key.")
+            if not hmac.compare_digest(school.admin_key, admin_key):
+                raise ForbiddenError("Invalid admin key.")
+
         config = school.config
         enable_logging = bool(config.enable_logging) if config else False
 

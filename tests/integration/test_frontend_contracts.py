@@ -8,14 +8,14 @@ from tests.fakes import FakeClock, InMemoryStorage
 
 def login(client: TestClient, role: str) -> None:
     """Authenticate a seeded role through the same cookie API as the frontend."""
-    response = client.post(
-        "/api/v1/auth/login",
-        json={
-            "email": f"{role}@test.edu",
-            "password": f"{role.title()}@123",
-            "loginType": "student" if role == "student" else "admin",
-        },
-    )
+    payload: dict[str, object] = {
+        "email": f"{role}@test.edu",
+        "password": f"{role.title()}@123",
+        "loginType": "student" if role == "student" else "admin",
+    }
+    if role != "student":
+        payload["adminKey"] = "test-admin-key"
+    response = client.post("/api/v1/auth/login", json=payload)
     assert response.status_code == 200, response.text
 
 

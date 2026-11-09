@@ -31,7 +31,7 @@ The Python seed creates **Demo Academy (`demo-school`)** and **Demo Academy 2 (`
 3. For a teacher or admin, select the **Admin** tab, enter `demo-admin-key` when prompted, then enter the staff member's email and password.
 4. Log out before switching accounts, especially when switching roles or schools.
 
-The school admin key unlocks the staff login tab; the account password is still required. Teachers also use this tab. Staff accounts are rejected on the student portal, and student accounts are rejected on the staff portal.
+The school admin key unlocks the staff login tab and is sent with the staff login request; the API rejects any teacher/admin login without a matching key, so the account password alone is never enough. Teachers also use this tab. Staff accounts are rejected on the student portal, and student accounts are rejected on the staff portal.
 
 The development frontend selects its school using `NEXT_PUBLIC_DEV_HOSTNAME` in `.env.local`, currently `demo-school`. Restart the frontend after changing this value. Changing the URL alone does not select a different school while this development override is in use.
 

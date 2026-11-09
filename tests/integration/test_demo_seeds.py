@@ -138,6 +138,11 @@ def test_demo_logins_and_assignment_reads_are_tenant_scoped(
             "password": account.password,
             "loginType": "student" if account.role == UserRole.STUDENT else "admin",
             "schoolId": own["school"],
+            **(
+                {"adminKey": definition.admin_key}
+                if account.role != UserRole.STUDENT
+                else {}
+            ),
         }
         response = client.post("/api/v1/auth/login", json=credentials)
         assert response.status_code == 200, response.text
@@ -186,12 +191,14 @@ def test_demo_teacher_cannot_target_foreign_classroom(
     """Cross-school classroom IDs cannot be used in assignment creation or filters."""
     own = demo_tenants["demo-school"]
     foreign = demo_tenants["demo-school-2"]
+    definition = next(d for d in DEMO_SCHOOLS if d.subdomain == "demo-school")
     response = client.post(
         "/api/v1/auth/login",
         json={
             "email": "teacher@demo-school.edu",
             "password": "Teacher@123",
             "schoolId": own["school"],
+            "adminKey": definition.admin_key,
         },
     )
     assert response.status_code == 200, response.text

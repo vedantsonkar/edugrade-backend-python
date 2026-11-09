@@ -1,10 +1,16 @@
 """Unit tests: tokens, rate limiting, grading strategies, storage keys."""
 
+import base64
+import json
+from datetime import timedelta
 from uuid import uuid4
 
+import jwt
 import pytest
 from app.core.errors import ForbiddenError, ValidationFailedError
 from app.core.ratelimit.base import parse_limit
+from app.core.security.principal import UserPrincipal
+from app.core.security.tokens import Hs256TokenService
 from app.core.storage.keys import (
     audit_archive_key,
     ensure_key_accessible,
@@ -34,8 +40,7 @@ def _question(qtype: QuestionType, correct: list[int], points: int = 2) -> Quest
     Returns:
         Question with options attached.
     """
-    question = Question(assignment_id="a1", type=qtype, text="Q?", points=points,
-                        display_order=1)
+    question = Question(assignment_id="a1", type=qtype, text="Q?", points=points, display_order=1)
     question.id = uuid4()
     for index in range(1, 4):
         option = QuestionOption(
@@ -59,9 +64,7 @@ def _answer(question: Question, raw: object) -> StudentAnswer:
     Returns:
         Answer entity.
     """
-    return StudentAnswer(
-        attempt_id="t1", question_id=str(question.id), answer_data=raw
-    )
+    return StudentAnswer(attempt_id="t1", question_id=str(question.id), answer_data=raw)
 
 
 class TestGradingStrategies:
@@ -114,9 +117,7 @@ class TestGradingStrategies:
         """Without a grader, free text stays ungraded (never fails submit)."""
         question = _question(QuestionType.FREE_TEXT, correct=[])
         answer = _answer(question, "Plants need light for energy.")
-        outcome = await build_registry(None)[QuestionType.FREE_TEXT].grade(
-            question, answer
-        )
+        outcome = await build_registry(None)[QuestionType.FREE_TEXT].grade(question, answer)
         assert outcome.is_correct is None
         assert outcome.points_awarded is None
 
@@ -129,8 +130,10 @@ class TestAttemptBehavior:
         from datetime import UTC, datetime
 
         attempt = AssessmentAttempt(
-            assignment_id="a", student_id="s",
-            status=AttemptStatus.IN_PROGRESS, tab_switch_count=0,
+            assignment_id="a",
+            student_id="s",
+            status=AttemptStatus.IN_PROGRESS,
+            tab_switch_count=0,
         )
         assert attempt.register_tab_switch(max_switches=2, enable_detection=True) is False
         assert attempt.register_tab_switch(max_switches=2, enable_detection=True) is False
@@ -141,8 +144,10 @@ class TestAttemptBehavior:
     def test_tab_detection_disabled_never_terminates(self) -> None:
         """With detection off, counters stay put and no termination occurs."""
         attempt = AssessmentAttempt(
-            assignment_id="a", student_id="s",
-            status=AttemptStatus.IN_PROGRESS, tab_switch_count=0,
+            assignment_id="a",
+            student_id="s",
+            status=AttemptStatus.IN_PROGRESS,
+            tab_switch_count=0,
         )
         for _ in range(5):
             assert attempt.register_tab_switch(max_switches=1, enable_detection=False) is False
@@ -151,8 +156,11 @@ class TestAttemptBehavior:
     def test_effective_score_prefers_override(self) -> None:
         """Override wins over the computed score."""
         attempt = AssessmentAttempt(
-            assignment_id="a", student_id="s", score=5.0,
-            status=AttemptStatus.IN_PROGRESS, tab_switch_count=0,
+            assignment_id="a",
+            student_id="s",
+            score=5.0,
+            status=AttemptStatus.IN_PROGRESS,
+            tab_switch_count=0,
         )
         assert attempt.effective_score == 5.0
         attempt.grade_override = 8.0
@@ -224,7 +232,7 @@ class TestFakeTokenServiceContract:
             id=uuid4(), email="e@x.y", name="N", role="STUDENT", school_id="s1"
         )
         access = tokens.create_access_token(principal)
-        with pytest.raises(ValueError):
+        with pytest.raises(jwt.InvalidTokenError):
             tokens.decode(access, expected_type="refresh")
         claims = tokens.decode(access, expected_type="access")
         assert claims["role"] == "STUDENT"
@@ -238,5 +246,70 @@ class TestFakeTokenServiceContract:
         principal = UserPrincipal(id=uuid4(), email="e@x.y", name="N", role="ADMIN")
         access = tokens.create_access_token(principal)
         clock.advance(11)
-        with pytest.raises(ValueError):
+        with pytest.raises(jwt.InvalidTokenError):
             tokens.decode(access, expected_type="access")
+
+
+class TestHs256TokenSigning:
+    """The production HS256 service rejects forged and tampered tokens."""
+
+    @staticmethod
+    def _service(secret: str = "unit-test-secret-0123456789abcdef") -> Hs256TokenService:
+        """Build a real signing service around the system clock.
+
+        PyJWT validates ``exp`` against wall-clock time, so the real clock
+        (not the fixed-epoch fake) keeps round trips deterministically valid.
+
+        Args:
+            secret: HMAC signing secret (>= 32 bytes per RFC 7518).
+
+        Returns:
+            Token service instance.
+        """
+        from app.core.clock import SystemClock
+
+        return Hs256TokenService(
+            secret=secret,
+            access_ttl=timedelta(minutes=15),
+            refresh_ttl=timedelta(days=7),
+            clock=SystemClock(),
+        )
+
+    @staticmethod
+    def _principal(role: str = "STUDENT") -> UserPrincipal:
+        """Build a principal for token minting.
+
+        Args:
+            role: Role claim to embed.
+
+        Returns:
+            Principal with a fixed school context.
+        """
+        return UserPrincipal(id=uuid4(), email="s@x.y", name="S", role=role, school_id=str(uuid4()))
+
+    def test_round_trip_preserves_identity(self) -> None:
+        """A token minted by the service decodes back to the same claims."""
+        service = self._service()
+        token = service.create_access_token(self._principal())
+        claims = service.decode(token, expected_type="access")
+        assert claims["role"] == "STUDENT"
+        assert claims["schoolId"] is not None
+
+    def test_wrong_secret_signature_rejected(self) -> None:
+        """A token signed by another secret never verifies."""
+        attacker = self._service("attacker-secret-0123456789abcdef")
+        verifier = self._service("real-secret-0123456789abcdef-3210")
+        token = attacker.create_access_token(self._principal())
+        with pytest.raises(jwt.InvalidTokenError):
+            verifier.decode(token, expected_type="access")
+
+    def test_tampered_role_claim_rejected(self) -> None:
+        """Editing the payload without re-signing invalidates the token."""
+        service = self._service()
+        token = service.create_access_token(self._principal("STUDENT"))
+        header, payload, signature = token.split(".")
+        claims = json.loads(base64.urlsafe_b64decode(payload + "=="))
+        claims["role"] = "ADMIN"  # Privilege-escalation attempt.
+        forged = base64.urlsafe_b64encode(json.dumps(claims).encode()).decode().rstrip("=")
+        with pytest.raises(jwt.InvalidTokenError):
+            service.decode(f"{header}.{forged}.{signature}", expected_type="access")
