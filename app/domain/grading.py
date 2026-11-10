@@ -3,7 +3,8 @@
 :class:`Submission`, :class:`Attachment`, and the :class:`BatchGradingTask`
 state machine. A submission is a student's hand-in for an offline assignment; attachments
 point at storage keys. Batch tasks coordinate asynchronous Gemini Batch API
-runs (enqueue → upload → poll → finalize).
+runs (enqueue → upload → poll → finalize); :class:`GradingAttempt` records
+each execution (initial run and retries).
 """
 
 from datetime import datetime
@@ -14,7 +15,12 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.types import JSON
 
 from app.core.db.base import UUID_KEY, Base, TimestampMixin, UUID7PKMixin, utc_now
-from app.domain.enums import BatchGradingMode, BatchGradingTaskStatus, BatchGradingTrigger
+from app.domain.enums import (
+    BatchGradingMode,
+    BatchGradingTaskStatus,
+    BatchGradingTrigger,
+    GradingAttemptStatus,
+)
 
 if TYPE_CHECKING:
     from app.domain.assignments import Assignment
@@ -99,7 +105,9 @@ class BatchGradingTask(UUID7PKMixin, TimestampMixin, Base):
     """Asynchronous batch grading job following a strict state machine.
 
     State flow: ``QUEUED → RUNNING → COMPLETED | PARTIAL | FAILED``
-    (``CANCELLED`` terminal). Progress counters are updated as results are
+    (``CANCELLED`` terminal). Retryable failures requeue the task as
+    ``QUEUED`` with ``next_retry_at`` set; each execution is recorded as a
+    :class:`GradingAttempt`. Progress counters are updated as results are
     applied; ``request_mappings`` maps submission ids to Gemini request keys.
 
     Attributes:
@@ -109,7 +117,11 @@ class BatchGradingTask(UUID7PKMixin, TimestampMixin, Base):
         mode: Which submissions the task grades.
         status: Current state machine position.
         created_by_id: Requesting user for manual tasks.
-        total / processed / graded / failed_submissions: Progress counters.
+        total / processed / graded / failed_submissions: Progress counters
+            of the latest run.
+        retry_count: Retries consumed since the last (re)queue reset.
+        next_retry_at: Earliest instant the worker may restart a QUEUED
+            task (``None`` = eligible immediately).
         request_mappings: Gemini request-key → submission-id mapping.
         failure_details: Per-submission failure records.
         gemini_job_name / gemini_input_file_name / gemini_output_file_name:
@@ -138,6 +150,8 @@ class BatchGradingTask(UUID7PKMixin, TimestampMixin, Base):
     processed_submissions: Mapped[int] = mapped_column(Integer, default=0)
     graded_submissions: Mapped[int] = mapped_column(Integer, default=0)
     failed_submissions: Mapped[int] = mapped_column(Integer, default=0)
+    retry_count: Mapped[int] = mapped_column(Integer, default=0)
+    next_retry_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     request_mappings: Mapped[dict[str, object] | None] = mapped_column(JSON)
     failure_details: Mapped[list[object] | None] = mapped_column(JSON)
     gemini_job_name: Mapped[str | None] = mapped_column(String(512))
@@ -150,3 +164,45 @@ class BatchGradingTask(UUID7PKMixin, TimestampMixin, Base):
     assignment: Mapped[Assignment] = relationship(back_populates="batch_tasks", lazy="selectin")
     school: Mapped[School] = relationship(back_populates="batch_tasks")
     created_by: Mapped[User | None] = relationship(back_populates="batch_tasks_created")
+    attempts: Mapped[list[GradingAttempt]] = relationship(
+        back_populates="task",
+        order_by="GradingAttempt.attempt_number",
+        lazy="selectin",
+    )
+
+
+class GradingAttempt(UUID7PKMixin, TimestampMixin, Base):
+    """One execution of a batch grading task (initial run or retry).
+
+    A ``PENDING`` row is created when a task is enqueued or a retry is
+    scheduled; the worker flips it to ``SUCCESS`` (job finished, every
+    submission graded) or ``FAILED`` (any other outcome) as the run
+    resolves. Attempt rows are the run-history record; live provider
+    bookkeeping stays on the owning :class:`BatchGradingTask`.
+
+    Attributes:
+        task_id: Owning batch grading task.
+        attempt_number: Monotonic 1-based execution index for the task.
+        status: ``PENDING`` / ``SUCCESS`` / ``FAILED``.
+        total / graded / failed_submissions: Outcome counters of this run.
+        error_message: Failure explanation when ``FAILED``.
+        started_at / completed_at: Run boundaries.
+    """
+
+    __tablename__ = "grading_attempts"
+
+    task_id: Mapped[str] = mapped_column(
+        UUID_KEY, ForeignKey("batch_grading_tasks.id", ondelete="CASCADE"), index=True
+    )
+    attempt_number: Mapped[int] = mapped_column(Integer, default=1)
+    status: Mapped[GradingAttemptStatus] = mapped_column(
+        default=GradingAttemptStatus.PENDING, index=True
+    )
+    total_submissions: Mapped[int] = mapped_column(Integer, default=0)
+    graded_submissions: Mapped[int] = mapped_column(Integer, default=0)
+    failed_submissions: Mapped[int] = mapped_column(Integer, default=0)
+    error_message: Mapped[str | None] = mapped_column(Text)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    task: Mapped[BatchGradingTask] = relationship(back_populates="attempts")

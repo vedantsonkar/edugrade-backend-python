@@ -21,6 +21,11 @@ from app.core.clock import Clock, SystemClock
 from app.core.config import Settings, get_settings
 from app.core.db.base import Base
 from app.core.db.engine import build_engine, build_sessionmaker, session_scope
+from app.core.events import (
+    InMemoryTaskEventBroker,
+    RedisTaskEventBroker,
+    TaskEventBroker,
+)
 from app.core.ids import IdProvider, Uuid7Provider
 from app.core.ratelimit.base import RateLimiter
 from app.core.ratelimit.memory import MemoryRateLimiter
@@ -43,6 +48,7 @@ from app.repositories.audit import AuditLogRepository
 from app.repositories.grading import (
     AttachmentRepository,
     BatchGradingTaskRepository,
+    GradingAttemptRepository,
     SubmissionRepository,
 )
 from app.repositories.schools import SchoolConfigRepository, SchoolRepository
@@ -91,6 +97,8 @@ class Container:
         engine: Async SQLAlchemy engine.
         sessionmaker: Session factory.
         redis: Redis client (``None`` when unavailable → memory limiter).
+        redis_events: Dedicated Redis client for pub/sub events (``None``
+            when Redis is unavailable → in-memory broker).
         llm: Direct grader on the :class:`LlmGrader` port (``None`` when
             unconfigured).
         batch_llm: Batch client on the :class:`BatchGradingClient` port
@@ -110,10 +118,12 @@ class Container:
     engine: AsyncEngine
     sessionmaker: async_sessionmaker[AsyncSession]
     redis: aioredis.Redis | None = None
+    redis_events: aioredis.Redis | None = None
     llm: LlmGrader | None = field(default=None)
     batch_llm: BatchGradingClient | None = field(default=None)
     grading_registry: dict[str, GradingProviderBundle] = field(default_factory=dict)
     ocr_registry: dict[str, OcrProvider] = field(default_factory=dict)
+    _memory_broker: InMemoryTaskEventBroker | None = field(default=None, repr=False)
 
     @classmethod
     def build(cls, settings: Settings | None = None) -> Container:
@@ -162,6 +172,11 @@ class Container:
         ocr_registry = build_ocr_registry(settings, http_client)
 
         engine = build_engine(settings)
+        events_redis: aioredis.Redis | None = None
+        if redis_client is not None:
+            # Dedicated client for pub/sub: no aggressive socket timeouts, so
+            # blocking pubsub reads can hold their full tick window.
+            events_redis = aioredis.from_url(settings.redis_url, decode_responses=True)
         return cls(
             settings=settings,
             clock=SystemClock(),
@@ -174,6 +189,7 @@ class Container:
             engine=engine,
             sessionmaker=build_sessionmaker(engine),
             redis=redis_client,
+            redis_events=events_redis,
             llm=llm,
             batch_llm=batch_llm,
             grading_registry=grading_registry,
@@ -186,6 +202,25 @@ class Container:
         await self.http_client.aclose()
         if self.redis is not None:
             await self.redis.aclose()
+        if self.redis_events is not None:
+            await self.redis_events.aclose()
+
+    def task_event_broker(self) -> TaskEventBroker:
+        """Build a broker for grading-task state events.
+
+        Redis-backed when the events client is available (fresh instance per
+        connection; pubsub state is per-connection). Otherwise a shared
+        process-local broker, so publishers and subscribers within one
+        process (tests, single-worker deployments) meet.
+
+        Returns:
+            A :class:`TaskEventBroker` instance.
+        """
+        if self.redis_events is not None:
+            return RedisTaskEventBroker(self.redis_events)
+        if self._memory_broker is None:
+            self._memory_broker = InMemoryTaskEventBroker()
+        return self._memory_broker
 
     async def create_tables(self) -> None:
         """Create all tables (development/test bootstrap convenience)."""
@@ -487,14 +522,17 @@ def get_auth_service(
     )
 
 
-def get_assignment_service(
-    session: AsyncSession = SessionDep,
-    container: Container = ContainerDep,
+def build_assignment_service(
+    session: AsyncSession, container: Container
 ) -> AssignmentService:
-    """Build the assignment service for this request.
+    """Build the assignment service on one session.
+
+    Shared by the request-scoped DI provider and the grading-task stream
+    generator, which opens short-lived sessions per tick (stream handlers
+    must not hold a request session across the response body).
 
     Args:
-        session: Request session.
+        session: Session backing the service repositories.
         container: App container.
 
     Returns:
@@ -508,9 +546,27 @@ def get_assignment_service(
         submissions=SubmissionRepository(session),
         attachments=AttachmentRepository(session),
         tasks=BatchGradingTaskRepository(session),
+        attempts=GradingAttemptRepository(session),
+        max_attempts=container.settings.grading_retry_max_attempts,
         classrooms=ClassroomRepository(session),
         clock=container.clock,
     )
+
+
+def get_assignment_service(
+    session: AsyncSession = SessionDep,
+    container: Container = ContainerDep,
+) -> AssignmentService:
+    """Build the assignment service for this request.
+
+    Args:
+        session: Request session.
+        container: App container.
+
+    Returns:
+        Service instance.
+    """
+    return build_assignment_service(session, container)
 
 
 def get_assessment_service(
@@ -531,17 +587,7 @@ def get_assessment_service(
         answers=StudentAnswerRepository(session),
         questions=QuestionRepository(session),
         assignments=AssignmentRepository(session),
-        assignment_service=AssignmentService(
-            assignments=AssignmentRepository(session),
-            targets=AssignmentTargetRepository(session),
-            questions=QuestionRepository(session),
-            comments=RubricCommentRepository(session),
-            submissions=SubmissionRepository(session),
-            attachments=AttachmentRepository(session),
-            tasks=BatchGradingTaskRepository(session),
-            classrooms=ClassroomRepository(session),
-            clock=container.clock,
-        ),
+        assignment_service=build_assignment_service(session, container),
         strategies=build_registry(container.llm),
         storage=container.storage,
         clock=container.clock,

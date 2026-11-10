@@ -1,7 +1,7 @@
 """Idempotent development seeder.
 
-Creates two isolated demo schools, each with config, taxonomy, a classroom,
-an admin, a teacher, two students, and a quiz. Existing schools are skipped
+Creates two isolated UAT schools with multiple classrooms, staff, students,
+and a mix of online assessments and offline assignments. Existing schools are skipped
 independently, preserving their users and data. Run via ``make seed``.
 
 Usage:
@@ -41,7 +41,7 @@ class DemoSchoolSeed:
     school_key: str
     admin_key: str
     primary_color: str
-    assignment_title: str
+    label: str
 
 
 @dataclass(frozen=True)
@@ -57,39 +57,60 @@ class DemoUserSeed:
 
 DEMO_SCHOOLS = (
     DemoSchoolSeed(
-        name="Demo Academy",
-        school_key="demo-school",
-        admin_key="demo-admin-key",
-        primary_color="#3b82f6",
-        assignment_title="Photosynthesis Basics",
+        "Riverdale Public School",
+        "riverdale-uat",
+        "riverdale-uat-admin-key",
+        "#3b82f6",
+        "Riverdale",
     ),
     DemoSchoolSeed(
-        name="Demo Academy 2",
-        school_key="demo-school-2",
-        admin_key="demo-admin-key-2",
-        primary_color="#059669",
-        assignment_title="Photosynthesis Basics (School 2)",
+        "Greenfield International School",
+        "greenfield-uat",
+        "greenfield-uat-admin-key",
+        "#059669",
+        "Greenfield",
     ),
 )
 
-DEMO_USERS = (
-    DemoUserSeed("admin", "Ada Admin", UserRole.ADMIN, "Admin@123"),
-    DemoUserSeed("teacher", "Tara Teacher", UserRole.TEACHER, "Teacher@123"),
-    DemoUserSeed(
-        "student1",
-        "Sam Student",
-        UserRole.STUDENT,
-        "20090101",
-        datetime(2009, 1, 1, tzinfo=UTC),
-    ),
-    DemoUserSeed(
-        "student2",
-        "Sara Student",
-        UserRole.STUDENT,
-        "20090102",
-        datetime(2009, 1, 2, tzinfo=UTC),
-    ),
+# Every classroom has a separate teacher and four students. Labels in display
+# names make both tenant and classroom boundaries visible in the interface.
+CLASSES = ((8, "A"), (8, "B"), (9, "A"), (9, "B"))
+TEACHER_NAMES = ("Ananya Sharma", "Vikram Mehta", "Priya Nair", "Rohan Kapoor")
+STUDENT_NAMES = (
+    ("Aarav Patel", "Diya Shah", "Kabir Gupta", "Meera Rao"),
+    ("Ishaan Joshi", "Anika Iyer", "Reyansh Das", "Tara Malhotra"),
+    ("Arjun Singh", "Saanvi Verma", "Aditya Menon", "Riya Desai"),
+    ("Dev Khanna", "Myra Sethi", "Kunal Bhat", "Nisha Jain"),
 )
+
+
+def demo_users(definition: DemoSchoolSeed) -> tuple[DemoUserSeed, ...]:
+    """Return predictable login credentials and labeled names for a school."""
+    users = [
+        DemoUserSeed("admin", f"Kavita Rao ({definition.label} Admin)", UserRole.ADMIN, "Admin@123")
+    ]
+    for index, (grade, division) in enumerate(CLASSES):
+        class_label = f"{definition.label} {grade}{division}"
+        users.append(
+            DemoUserSeed(
+                f"teacher{grade}{division.lower()}",
+                f"{TEACHER_NAMES[index]} ({class_label})",
+                UserRole.TEACHER,
+                "Teacher@123",
+            )
+        )
+        for number, name in enumerate(STUDENT_NAMES[index], start=1):
+            dob = datetime(2011 if grade == 9 else 2012, index + 1, number, tzinfo=UTC)
+            users.append(
+                DemoUserSeed(
+                    f"student{grade}{division.lower()}.{number}",
+                    f"{name} ({class_label})",
+                    UserRole.STUDENT,
+                    f"Student@{grade}{division.lower()}{number}",
+                    dob,
+                )
+            )
+    return tuple(users)
 
 
 async def seed() -> None:
@@ -107,7 +128,7 @@ async def seed() -> None:
             status = "Created" if definition.school_key in created else "Already present; unchanged"
             print(f"{status}: {definition.name} (school key={definition.school_key})")
             print(f"  admin key   : {definition.admin_key} (seed default)")
-            for account in DEMO_USERS:
+            for account in demo_users(definition):
                 print(
                     f"  {account.email_prefix:12}: "
                     f"{account.email_prefix}@{definition.school_key}.edu / {account.password}"
@@ -133,9 +154,7 @@ async def seed_demo_schools(
     created: list[str] = []
     for definition in DEMO_SCHOOLS:
         existing = (
-            await session.execute(
-                select(School).where(School.school_key == definition.school_key)
-            )
+            await session.execute(select(School).where(School.school_key == definition.school_key))
         ).scalar_one_or_none()
         if existing is not None:
             continue
@@ -161,30 +180,35 @@ async def _create_demo_school(
         SchoolConfig(
             school_id=str(school.id),
             enable_logging=True,
-            current_academic_year="2025-2026",
+            current_academic_year=f"{now.year}-{now.year + 1}",
         )
     )
 
-    grade9 = Grade(school_id=str(school.id), name="Grade 9", display_order=9)
-    grade10 = Grade(school_id=str(school.id), name="Grade 10", display_order=10)
-    session.add_all([grade9, grade10])
-    await session.flush()
-
-    division_a = Division(school_id=str(school.id), name="A")
-    division_b = Division(school_id=str(school.id), name="B")
-    session.add_all([division_a, division_b])
+    grades = {
+        number: Grade(school_id=str(school.id), name=f"Grade {number}", display_order=number)
+        for number in (8, 9)
+    }
+    divisions = {name: Division(school_id=str(school.id), name=name) for name in ("A", "B")}
+    session.add_all([*grades.values(), *divisions.values()])
     await session.flush()
 
     accounts: dict[str, User] = {}
-    for account in DEMO_USERS:
-        student = account.role == UserRole.STUDENT
+    for account in demo_users(definition):
+        class_match = next(
+            (
+                (grade, division)
+                for grade, division in CLASSES
+                if account.email_prefix.startswith(f"student{grade}{division.lower()}.")
+            ),
+            None,
+        )
         user = User(
             email=f"{account.email_prefix}@{definition.school_key}.edu",
             name=account.name,
             role=account.role,
             school_id=str(school.id),
-            grade_id=str(grade9.id) if student else None,
-            division_id=str(division_a.id) if student else None,
+            grade_id=str(grades[class_match[0]].id) if class_match else None,
+            division_id=str(divisions[class_match[1]].id) if class_match else None,
             password_hash=hasher.hash(account.password),
             auth_method=AuthMethod.CREDENTIALS,
             date_of_birth=account.date_of_birth,
@@ -193,74 +217,89 @@ async def _create_demo_school(
         accounts[account.email_prefix] = user
     await session.flush()
 
-    classroom = Classroom(
-        school_id=str(school.id),
-        grade_id=str(grade9.id),
-        division_id=str(division_a.id),
-        class_teacher_id=str(accounts["teacher"].id),
-        academic_year="2025-2026",
-    )
-    session.add(classroom)
-    await session.flush()
-
-    assignment = Assignment(
-        school_id=str(school.id),
-        teacher_id=str(accounts["teacher"].id),
-        type=AssignmentType.ONLINE,
-        title=definition.assignment_title,
-        description="A quick check on photosynthesis.",
-        subject="Biology",
-        start_date=now - timedelta(hours=1),
-        due_date=now + timedelta(days=7),
-        time_limit=30,
-    )
-    session.add(assignment)
-    await session.flush()
-
-    session.add(AssignmentTarget(assignment_id=str(assignment.id), class_id=str(classroom.id)))
-
-    q1 = Question(
-        assignment_id=str(assignment.id),
-        type=QuestionType.MCQ_SINGLE,
-        text="Which pigment absorbs light in photosynthesis?",
-        points=2,
-        display_order=1,
-        explanation="Chlorophyll is the primary light-absorbing pigment.",
-    )
-    session.add(q1)
-    await session.flush()
-    session.add_all(
-        [
-            QuestionOption(
-                question_id=str(q1.id),
-                text="Chlorophyll",
-                is_correct=True,
-                display_order=1,
+    academic_year = f"{now.year}-{now.year + 1}"
+    for grade, division in CLASSES:
+        teacher = accounts[f"teacher{grade}{division.lower()}"]
+        classroom = Classroom(
+            school_id=str(school.id),
+            grade_id=str(grades[grade].id),
+            division_id=str(divisions[division].id),
+            class_teacher_id=str(teacher.id),
+            academic_year=academic_year,
+        )
+        session.add(classroom)
+        await session.flush()
+        label = f"{definition.label} {grade}{division}"
+        topics = (
+            (
+                "Science",
+                "Photosynthesis and plant nutrition",
+                "Explain how leaves make food and why light is essential.",
             ),
-            QuestionOption(
-                question_id=str(q1.id),
-                text="Melanin",
-                is_correct=False,
-                display_order=2,
+            (
+                "Mathematics",
+                "Linear equations in everyday life",
+                "Show your working for three real-world linear equation problems.",
             ),
-            QuestionOption(
-                question_id=str(q1.id),
-                text="Hemoglobin",
-                is_correct=False,
-                display_order=3,
-            ),
-        ]
-    )
-
-    q2 = Question(
-        assignment_id=str(assignment.id),
-        type=QuestionType.FREE_TEXT,
-        text="Explain, in two sentences, why plants need sunlight.",
-        points=5,
-        display_order=2,
-    )
-    session.add(q2)
-
+        )
+        for index, (subject, title, description) in enumerate(topics):
+            online = index == 0
+            assignment = Assignment(
+                school_id=str(school.id),
+                teacher_id=str(teacher.id),
+                type=AssignmentType.ONLINE if online else AssignmentType.OFFLINE,
+                title=f"{title} — {label}",
+                description=description,
+                subject=subject,
+                start_date=now - timedelta(days=2),
+                due_date=now + timedelta(days=7 + index * 3),
+                time_limit=30 if online else None,
+                auto_grade_on_due_date=False,
+            )
+            session.add(assignment)
+            await session.flush()
+            session.add(
+                AssignmentTarget(assignment_id=str(assignment.id), class_id=str(classroom.id))
+            )
+            if online:
+                question = Question(
+                    assignment_id=str(assignment.id),
+                    type=QuestionType.MCQ_SINGLE,
+                    text="Which pigment absorbs light for photosynthesis?",
+                    points=2,
+                    display_order=1,
+                    explanation="Chlorophyll absorbs light energy.",
+                )
+                session.add(question)
+                await session.flush()
+                session.add_all(
+                    [
+                        QuestionOption(
+                            question_id=str(question.id),
+                            text=text,
+                            is_correct=correct,
+                            display_order=order,
+                        )
+                        for order, (text, correct) in enumerate(
+                            (
+                                ("Chlorophyll", True),
+                                ("Melanin", False),
+                                ("Haemoglobin", False),
+                                ("Keratin", False),
+                            ),
+                            start=1,
+                        )
+                    ]
+                )
+                session.add(
+                    Question(
+                        assignment_id=str(assignment.id),
+                        type=QuestionType.FREE_TEXT,
+                        text="Describe how a plant uses sunlight to make food.",
+                        points=5,
+                        display_order=2,
+                    )
+                )
     await session.flush()
 
 

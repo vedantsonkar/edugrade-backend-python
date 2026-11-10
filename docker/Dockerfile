@@ -31,4 +31,4 @@ EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s \
     CMD python -c "import os, urllib.request; urllib.request.urlopen('http://localhost:'+os.environ.get('PORT','8080')+'/api/v1/health', timeout=4)"
 
-CMD ["sh", "-c", "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port ${PORT} --workers ${WORKERS}"]
+CMD ["python", "scripts/start.py"]

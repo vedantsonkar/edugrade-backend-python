@@ -54,22 +54,26 @@ docker compose exec api python scripts/seed.py
 make install      # venv + deps (requires Python 3.13+)
 make dev          # uvicorn --reload (needs postgres/redis/seaweedfs, see compose)
 make upgrade      # alembic upgrade head
-make seed         # two isolated demo schools, each with users and a quiz
+make seed         # two isolated UAT schools with classes and assignments
 make lint typecheck test   # quality gates (CI parity)
 ```
 
-Seeding creates `demo-school` (Demo Academy) and `demo-school-2` (Demo Academy 2).
-Each has an admin, teacher, two students, separate taxonomy/classroom IDs, and its
-own quiz. Existing schools are skipped independently without resetting passwords.
+Seeding creates two fictional UAT schools: Riverdale Public School (`riverdale-uat`)
+and Greenfield International School (`greenfield-uat`). Each has grades 8 and 9,
+divisions A and B, four students and a teacher per class, plus an admin. Every
+class has an online science assessment and an offline mathematics assignment.
+Names and assignment titles include the school and class to make isolation visible.
+Existing schools are skipped independently; existing data and passwords are not reset.
+The earlier `demo-school` tenants, if present, are left untouched.
 
-| Subdomain | Admin-tab key | Admin | Teacher | Students |
+| School key | Staff key | Admin login | Teacher login example | Student login example |
 | --- | --- | --- | --- | --- |
-| `demo-school` | `demo-admin-key` | `admin@demo-school.edu` | `teacher@demo-school.edu` | `student1@demo-school.edu`, `student2@demo-school.edu` |
-| `demo-school-2` | `demo-admin-key-2` | `admin@demo-school-2.edu` | `teacher@demo-school-2.edu` | `student1@demo-school-2.edu`, `student2@demo-school-2.edu` |
+| `riverdale-uat` | `riverdale-uat-admin-key` | `admin@riverdale-uat.edu` | `teacher8a@riverdale-uat.edu` | `student8a.1@riverdale-uat.edu` |
+| `greenfield-uat` | `greenfield-uat-admin-key` | `admin@greenfield-uat.edu` | `teacher8a@greenfield-uat.edu` | `student8a.1@greenfield-uat.edu` |
 
-Passwords in both schools: admin `Admin@123`, teacher `Teacher@123`, student1
-`20090101`, student2 `20090102`. Teachers use the Admin tab. See
-[Test Credentials.md](<Test Credentials.md>) for login and isolation demonstrations.
+Admin password: `Admin@123`; teacher password: `Teacher@123`. Student passwords follow the class and student number, for example
+`Student@8a1` for `student8a.1`. See
+[Test Credentials.md](<Test Credentials.md>) for all class logins.
 
 ## API surface (summary)
 

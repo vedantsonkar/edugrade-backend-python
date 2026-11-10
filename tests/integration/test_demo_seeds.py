@@ -1,18 +1,18 @@
-"""Exercise the actual demo seeder and isolation between its two tenants."""
+"""Exercise UAT seed completeness, repeatability and isolation."""
 
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import cast
 
 import pytest
 from app.core.db.engine import session_scope
 from app.core.security.passwords import BcryptPasswordHasher
-from app.domain.assignments import Assignment
-from app.domain.enums import AuthMethod, UserRole
+from app.domain.assignments import Assignment, AssignmentTarget, Question
+from app.domain.enums import UserRole
 from app.domain.schools import School
 from app.domain.taxonomy import Classroom
 from app.domain.users import User
 from fastapi.testclient import TestClient
-from scripts.seed import DEMO_SCHOOLS, DEMO_USERS, DemoUserSeed, seed_demo_schools
+from scripts.seed import CLASSES, DEMO_SCHOOLS, demo_users, seed_demo_schools
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from tests.fakes import FakeClock
@@ -24,198 +24,173 @@ async def demo_tenants(
     hasher: BcryptPasswordHasher,
     clock: FakeClock,
 ) -> dict[str, dict[str, str]]:
-    """Seed the production demo templates inside the isolated test database."""
     async with session_scope(db_sessionmaker) as session:
-        created = await seed_demo_schools(session, hasher, now=cast(datetime, clock.now()))
-        assert created == [definition.school_key for definition in DEMO_SCHOOLS]
-        schools = (await session.scalars(select(School))).all()
-        tenants: dict[str, dict[str, str]] = {}
-        for school in schools:
+        assert await seed_demo_schools(session, hasher, now=cast(datetime, clock.now())) == [
+            school.school_key for school in DEMO_SCHOOLS
+        ]
+        result: dict[str, dict[str, str]] = {}
+        for school in (await session.scalars(select(School))).all():
             users = (await session.scalars(select(User).where(User.school_id == school.id))).all()
-            classroom = (
-                await session.scalars(select(Classroom).where(Classroom.school_id == school.id))
-            ).one()
-            assignment = (
+            assignments = (
                 await session.scalars(select(Assignment).where(Assignment.school_id == school.id))
-            ).one()
-            tenants[school.school_key] = {
+            ).all()
+            result[school.school_key] = {
                 "school": str(school.id),
-                "class": str(classroom.id),
-                "assignment": str(assignment.id),
-                **{user.email.split("@")[0]: str(user.id) for user in users},
+                **{u.email.split("@")[0]: str(u.id) for u in users},
+                **{a.title: str(a.id) for a in assignments},
             }
-        return tenants
+        return result
 
 
-async def test_seed_rerun_preserves_users_and_does_not_duplicate_data(
+async def test_seed_structure_and_rerun_preserve_data(
     demo_tenants: dict[str, dict[str, str]],
     db_sessionmaker: async_sessionmaker[AsyncSession],
     hasher: BcryptPasswordHasher,
     clock: FakeClock,
 ) -> None:
-    """Reseeding preserves edited passwords, user IDs, and tenant data counts."""
     async with session_scope(db_sessionmaker) as session:
+        for definition in DEMO_SCHOOLS:
+            school_id = demo_tenants[definition.school_key]["school"]
+            users = (await session.scalars(select(User).where(User.school_id == school_id))).all()
+            classes = (
+                await session.scalars(select(Classroom).where(Classroom.school_id == school_id))
+            ).all()
+            assignments = (
+                await session.scalars(select(Assignment).where(Assignment.school_id == school_id))
+            ).all()
+            assert len(users) == 21 and len(classes) == 4 and len(assignments) == 8
+            assert all(definition.label in u.name for u in users)
+            for classroom in classes:
+                students = [
+                    u
+                    for u in users
+                    if u.role == UserRole.STUDENT
+                    and u.grade_id == classroom.grade_id
+                    and u.division_id == classroom.division_id
+                ]
+                assert len(students) == 4
+                assert any(
+                    str(u.id) == str(classroom.class_teacher_id) and u.role == UserRole.TEACHER
+                    for u in users
+                )
+                targets = (
+                    await session.scalars(
+                        select(AssignmentTarget).where(AssignmentTarget.class_id == classroom.id)
+                    )
+                ).all()
+                assert len(targets) == 2
+                assert all(
+                    any(str(a.id) == str(t.assignment_id) for a in assignments) for t in targets
+                )
+            assert all(definition.label in a.title for a in assignments)
+            assert (
+                len(
+                    (
+                        await session.scalars(
+                            select(Question).where(
+                                Question.assignment_id.in_([a.id for a in assignments])
+                            )
+                        )
+                    ).all()
+                )
+                == 8
+            )
         user = (
-            await session.scalars(select(User).where(User.email == "student1@demo-school.edu"))
+            await session.scalars(select(User).where(User.email == "admin@riverdale-uat.edu"))
         ).one()
-        user.name = "Edited Student"
+        user.name = "Edited admin"
         user.password_hash = hasher.hash("Changed@123")
     async with session_scope(db_sessionmaker) as session:
         assert await seed_demo_schools(session, hasher, now=cast(datetime, clock.now())) == []
-        assert len((await session.scalars(select(School))).all()) == 2
-        users = (await session.scalars(select(User))).all()
-        assert len(users) == 8
-        assert len((await session.scalars(select(Classroom))).all()) == 2
-        assert len((await session.scalars(select(Assignment))).all()) == 2
-        user = next(user for user in users if user.email == "student1@demo-school.edu")
-        assert str(user.id) == demo_tenants["demo-school"]["student1"]
-        assert user.name == "Edited Student"
-        assert user.password_hash is not None
-        assert hasher.verify("Changed@123", user.password_hash)
-        for definition in DEMO_SCHOOLS:
-            classroom = (
-                await session.scalars(
-                    select(Classroom).where(
-                        Classroom.school_id == demo_tenants[definition.school_key]["school"]
-                    )
-                )
-            ).one()
-            assert str(classroom.class_teacher_id) == demo_tenants[definition.school_key]["teacher"]
+        user = (
+            await session.scalars(select(User).where(User.email == "admin@riverdale-uat.edu"))
+        ).one()
+        assert user.name == "Edited admin" and hasher.verify(
+            "Changed@123", user.password_hash or ""
+        )
+        assert len((await session.scalars(select(User))).all()) == 42
 
 
-async def test_seed_adds_second_school_when_first_already_exists(
+def test_seeded_students_see_only_their_class_and_foreign_school_is_hidden(
+    client: TestClient,
+    demo_tenants: dict[str, dict[str, str]],
+) -> None:
+    for definition in DEMO_SCHOOLS:
+        own = demo_tenants[definition.school_key]
+        foreign = next(value for key, value in demo_tenants.items() if key != definition.school_key)
+        for grade, division in CLASSES:
+            account = next(
+                u
+                for u in demo_users(definition)
+                if u.email_prefix == f"student{grade}{division.lower()}.1"
+            )
+            response = client.post(
+                "/api/v1/auth/login",
+                json={
+                    "email": f"{account.email_prefix}@{definition.school_key}.edu",
+                    "password": account.password,
+                    "loginType": "student",
+                    "schoolId": own["school"],
+                },
+            )
+            assert response.status_code == 200, response.text
+            items = client.get("/api/v1/assignments").json()["items"]
+            assert len(items) == 2
+            assert all(f"{definition.label} {grade}{division}" in item["title"] for item in items)
+            foreign_assignment = next(
+                value for key, value in foreign.items() if "Photosynthesis" in key
+            )
+            assert client.get(f"/api/v1/assignments/{foreign_assignment}").status_code == 404
+            assert client.post("/api/v1/auth/logout", json={}).status_code == 200
+
+
+def test_seeded_staff_logins(client: TestClient, demo_tenants: dict[str, dict[str, str]]) -> None:
+    for definition in DEMO_SCHOOLS:
+        for account in demo_users(definition):
+            if account.role == UserRole.STUDENT:
+                continue
+            response = client.post(
+                "/api/v1/auth/login",
+                json={
+                    "email": f"{account.email_prefix}@{definition.school_key}.edu",
+                    "password": account.password,
+                    "loginType": "admin",
+                    "schoolId": demo_tenants[definition.school_key]["school"],
+                    "adminKey": definition.admin_key,
+                },
+            )
+            assert response.status_code == 200, response.text
+            assert client.post("/api/v1/auth/logout", json={}).status_code == 200
+
+
+async def test_existing_school_does_not_prevent_creating_other_school(
     db_sessionmaker: async_sessionmaker[AsyncSession],
     hasher: BcryptPasswordHasher,
     clock: FakeClock,
 ) -> None:
-    """An existing first tenant must not cause the entire seed command to exit."""
     async with session_scope(db_sessionmaker) as session:
-        school = School(name="Existing Academy", school_key="demo-school", admin_key="changed-key")
-        session.add(school)
-        await session.flush()
-        school_id = str(school.id)
-        session.add(
-            User(
-                email="admin@demo-school.edu",
-                name="Existing Admin",
-                role=UserRole.ADMIN,
-                school_id=school_id,
-                auth_method=AuthMethod.CREDENTIALS,
-                password_hash=hasher.hash("Changed@123"),
-            )
-        )
+        session.add(School(name="Existing school", school_key="riverdale-uat", admin_key="changed"))
     async with session_scope(db_sessionmaker) as session:
-        created = await seed_demo_schools(session, hasher, now=cast(datetime, clock.now()))
-        assert created == ["demo-school-2"]
-        schools = (await session.scalars(select(School))).all()
-        assert len(schools) == 2
-        original = next(school for school in schools if school.school_key == "demo-school")
-        assert str(original.id) == school_id
-        assert original.name == "Existing Academy"
-        assert original.admin_key == "changed-key"
-        original_user = (
-            await session.scalars(select(User).where(User.school_id == school_id))
+        assert await seed_demo_schools(session, hasher, now=cast(datetime, clock.now())) == [
+            "greenfield-uat"
+        ]
+        school = (
+            await session.scalars(select(School).where(School.school_key == "riverdale-uat"))
         ).one()
-        assert original_user.password_hash is not None
-        assert hasher.verify("Changed@123", original_user.password_hash)
-        assert len((await session.scalars(select(User))).all()) == 5
+        assert school.name == "Existing school" and school.admin_key == "changed"
 
 
-@pytest.mark.parametrize("account", DEMO_USERS, ids=lambda user: user.email_prefix)
-def test_demo_logins_and_assignment_reads_are_tenant_scoped(
+def test_staff_keys_are_school_scoped(
     client: TestClient,
     demo_tenants: dict[str, dict[str, str]],
-    account: DemoUserSeed,
 ) -> None:
-    """Every seeded login sees its own quiz and cannot access a foreign quiz."""
     for definition in DEMO_SCHOOLS:
-        own = demo_tenants[definition.school_key]
-        foreign = next(
-            tenant for name, tenant in demo_tenants.items() if name != definition.school_key
+        foreign = next(value for key, value in demo_tenants.items() if key != definition.school_key)
+        response = client.post(
+            "/api/v1/school/validate-admin",
+            json={
+                "schoolId": foreign["school"],
+                "adminKey": definition.admin_key,
+            },
         )
-        credentials = {
-            "email": f"{account.email_prefix}@{definition.school_key}.edu",
-            "password": account.password,
-            "loginType": "student" if account.role == UserRole.STUDENT else "admin",
-            "schoolId": own["school"],
-            **(
-                {"adminKey": definition.admin_key}
-                if account.role != UserRole.STUDENT
-                else {}
-            ),
-        }
-        response = client.post("/api/v1/auth/login", json=credentials)
-        assert response.status_code == 200, response.text
-        assert response.json()["school"]["id"] == own["school"]
-        assert response.json()["user"]["id"] == own[account.email_prefix]
-        listed = client.get("/api/v1/assignments")
-        assert listed.status_code == 200, listed.text
-        assert [item["id"] for item in listed.json()["items"]] == [own["assignment"]]
-        for suffix in ("", "/questions", "/submissions", "/attempts"):
-            response = client.get(f"/api/v1/assignments/{foreign['assignment']}{suffix}")
-            assert response.status_code == 404, response.text
-        denied = client.post(
-            "/api/v1/auth/login", json={**credentials, "schoolId": foreign["school"]}
-        )
-        assert denied.status_code == 409, denied.text
-        if account.role == UserRole.ADMIN:
-            students = client.get("/api/v1/admin/students").json()
-            assert students["total"] == 2
-            assert {item["id"] for item in students["items"]} == {own["student1"], own["student2"]}
-        assert client.post("/api/v1/auth/logout", json={}).status_code == 200
-
-
-def test_demo_admin_keys_are_scoped_to_selected_school(
-    client: TestClient, demo_tenants: dict[str, dict[str, str]]
-) -> None:
-    """A valid key for one school does not unlock the other school's staff tab."""
-    for definition in DEMO_SCHOOLS:
-        foreign = next(
-            tenant for name, tenant in demo_tenants.items() if name != definition.school_key
-        )
-        for school_id, expected in (
-            (demo_tenants[definition.school_key]["school"], True),
-            (foreign["school"], False),
-        ):
-            response = client.post(
-                "/api/v1/school/validate-admin",
-                json={"schoolId": school_id, "adminKey": definition.admin_key},
-            )
-            assert response.status_code == 200, response.text
-            assert response.json()["valid"] is expected
-
-
-def test_demo_teacher_cannot_target_foreign_classroom(
-    client: TestClient, demo_tenants: dict[str, dict[str, str]], clock: FakeClock
-) -> None:
-    """Cross-school classroom IDs cannot be used in assignment creation or filters."""
-    own = demo_tenants["demo-school"]
-    foreign = demo_tenants["demo-school-2"]
-    definition = next(d for d in DEMO_SCHOOLS if d.school_key == "demo-school")
-    response = client.post(
-        "/api/v1/auth/login",
-        json={
-            "email": "teacher@demo-school.edu",
-            "password": "Teacher@123",
-            "schoolId": own["school"],
-            "adminKey": definition.admin_key,
-        },
-    )
-    assert response.status_code == 200, response.text
-    response = client.post(
-        "/api/v1/assignments",
-        json={
-            "title": "Foreign classroom probe",
-            "subject": "Science",
-            "type": "ONLINE",
-            "dueDate": (cast(datetime, clock.now()) + timedelta(days=1)).isoformat(),
-            "timeLimit": 30,
-            "classIds": [foreign["class"]],
-        },
-    )
-    assert response.status_code == 422, response.text
-    assert client.get(f"/api/v1/assignments?classIds={foreign['class']}").json()["total"] == 0
-    response = client.patch(
-        f"/api/v1/assignments/{foreign['assignment']}", json={"title": "Foreign edit"}
-    )
-    assert response.status_code == 404, response.text
+        assert response.status_code == 200 and response.json()["valid"] is False

@@ -40,7 +40,23 @@ class SeaweedS3Storage:
         self._presign_expire = settings.seaweed_s3_presign_expire_seconds
         from botocore.config import Config
 
-        self._client: S3Client = boto3.client(
+        self._client: S3Client
+        self._signer: S3Client
+        if settings.aws_s3_use_instance_role:
+            self._client = boto3.client(
+                "s3",
+                region_name=settings.seaweed_s3_region,
+                config=Config(
+                    signature_version="s3v4",
+                    connect_timeout=3,
+                    read_timeout=5,
+                    retries={"max_attempts": 1},
+                ),
+            )
+            self._signer = self._client
+            return
+
+        self._client = boto3.client(
             "s3",
             endpoint_url=settings.seaweed_s3_endpoint,
             aws_access_key_id=settings.seaweed_s3_access_key_id,
@@ -50,7 +66,7 @@ class SeaweedS3Storage:
         )
 
         # Sign against the browser-facing origin without rewriting signed URLs.
-        self._signer: S3Client = boto3.client(
+        self._signer = boto3.client(
             "s3",
             endpoint_url=settings.seaweed_s3_public_endpoint or settings.seaweed_s3_endpoint,
             aws_access_key_id=settings.seaweed_s3_access_key_id,

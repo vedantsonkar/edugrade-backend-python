@@ -73,6 +73,16 @@ class Settings(BaseSettings):
         default="https://api.z.ai/api/paas/v4/layout_parsing",
     )
 
+    # ── Grading retries ──────────────────────────────────────────────────
+    grading_retry_fast_retries: int = Field(default=2, ge=0)
+    """Retries requeued immediately (next worker pass) before backoff kicks in."""
+    grading_retry_max_attempts: int = Field(default=5, ge=1)
+    """Total executions (initial run + retries) before a task is terminal."""
+    grading_retry_backoff_base_seconds: int = Field(default=60, ge=1)
+    """Exponential backoff base: base * 2^(retry - fast_retries - 1)."""
+    grading_retry_backoff_cap_seconds: int = Field(default=900, ge=1)
+    """Upper bound on a single retry delay."""
+
     # ── Object storage (SeaweedFS S3 gateway) ────────────────────────────
     seaweed_s3_endpoint: str = Field(default="http://localhost:8333")
     seaweed_s3_public_endpoint: str | None = Field(default=None)
@@ -81,6 +91,7 @@ class Settings(BaseSettings):
     seaweed_s3_bucket: str = Field(default="edugrade-files")
     seaweed_s3_region: str = Field(default="us-east-1")
     seaweed_s3_presign_expire_seconds: int = Field(default=3600, ge=30)
+    aws_s3_use_instance_role: bool = Field(default=False)
 
     # ── Rate limiting / system ───────────────────────────────────────────
     redis_url: str = Field(default="redis://localhost:6379/0")
@@ -144,6 +155,7 @@ def describe_settings(settings: Settings) -> dict[str, object]:
         A JSON-serializable mapping with secret values masked.
     """
     secret_fields = (
+        "database_url",
         "jwt_secret",
         "google_client_secret",
         "gemini_api_key",

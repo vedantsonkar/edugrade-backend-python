@@ -37,6 +37,33 @@ class GradingResultResponse(BaseSchema):
     plagiarism_analysis: str | None = None
 
 
+class GradingAttemptResponse(BaseSchema):
+    """One execution of a batch grading task (initial run or retry).
+
+    Attributes:
+        id: Attempt id.
+        attempt_number: 1-based execution index for the task.
+        status: ``PENDING`` / ``SUCCESS`` / ``FAILED``.
+        total_submissions: Submissions in scope for this run.
+        graded_submissions: Rows graded successfully in this run.
+        failed_submissions: Rows that failed in this run.
+        error_message: Failure explanation when ``FAILED``.
+        started_at / completed_at: Run boundaries.
+        created_at: Row creation timestamp.
+    """
+
+    id: IdStr
+    attempt_number: int
+    status: str
+    total_submissions: int = 0
+    graded_submissions: int = 0
+    failed_submissions: int = 0
+    error_message: str | None = None
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
+    created_at: datetime
+
+
 class BatchGradingTaskResponse(BaseSchema):
     """Batch grading task state for progress polling.
 
@@ -50,6 +77,10 @@ class BatchGradingTaskResponse(BaseSchema):
         processed_submissions: Rows resolved so far.
         graded_submissions: Rows graded successfully.
         failed_submissions: Rows that failed.
+        retry_count: Retries consumed since the last (re)queue reset.
+        max_attempts: Retry budget (total executions) configured server-side.
+        next_retry_at: When a QUEUED retry may run (``None`` = now/n.a.).
+        attempts: Run history, oldest first.
         error_message: Terminal failure explanation.
         started_at / completed_at: Run boundaries.
         created_at / updated_at: Timestamps.
@@ -64,6 +95,10 @@ class BatchGradingTaskResponse(BaseSchema):
     processed_submissions: int
     graded_submissions: int
     failed_submissions: int
+    retry_count: int = 0
+    max_attempts: int = 5
+    next_retry_at: datetime | None = None
+    attempts: list[GradingAttemptResponse] = []
     error_message: str | None = None
     started_at: datetime | None = None
     completed_at: datetime | None = None

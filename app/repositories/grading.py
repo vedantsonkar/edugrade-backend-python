@@ -1,4 +1,4 @@
-"""Repositories for submissions, attachments, and batch grading tasks."""
+"""Repositories for submissions, attachments, batch grading tasks, and attempts."""
 
 from datetime import datetime
 from uuid import UUID
@@ -7,8 +7,8 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.orm import selectinload
 
 from app.core.pagination import PageParams
-from app.domain.enums import BatchGradingTaskStatus
-from app.domain.grading import Attachment, BatchGradingTask, Submission
+from app.domain.enums import BatchGradingTaskStatus, GradingAttemptStatus
+from app.domain.grading import Attachment, BatchGradingTask, GradingAttempt, Submission
 from app.repositories.base import BaseRepository
 
 
@@ -183,6 +183,34 @@ class BatchGradingTaskRepository(BaseRepository[BatchGradingTask]):
         rows = (await self.session.execute(stmt)).scalars().all()
         return list(rows)
 
+    async def list_due_queued(
+        self, now: datetime, limit: int = 10
+    ) -> list[BatchGradingTask]:
+        """List QUEUED tasks whose retry gate has opened (worker intake).
+
+        Args:
+            now: Current instant; tasks with ``next_retry_at`` in the future
+                are withheld until their backoff expires.
+            limit: Safety cap per pass.
+
+        Returns:
+            Due tasks oldest-first.
+        """
+        stmt = (
+            select(BatchGradingTask)
+            .where(
+                BatchGradingTask.status == BatchGradingTaskStatus.QUEUED,
+                or_(
+                    BatchGradingTask.next_retry_at.is_(None),
+                    BatchGradingTask.next_retry_at <= now,
+                ),
+            )
+            .order_by(BatchGradingTask.created_at)
+            .limit(limit)
+        )
+        rows = (await self.session.execute(stmt)).scalars().all()
+        return list(rows)
+
     async def latest_for_assignment(self, assignment_id: str) -> BatchGradingTask | None:
         """Fetch the most recent task of an assignment.
 
@@ -190,15 +218,76 @@ class BatchGradingTaskRepository(BaseRepository[BatchGradingTask]):
             assignment_id: Assignment id.
 
         Returns:
-            The latest task, or ``None``.
+            The latest task (attempts eager-loaded), or ``None``.
         """
         stmt = (
             select(BatchGradingTask)
             .where(BatchGradingTask.assignment_id == assignment_id)
+            .options(selectinload(BatchGradingTask.attempts))
             .order_by(BatchGradingTask.created_at.desc())
             .limit(1)
         )
         return (await self.session.execute(stmt)).scalar_one_or_none()
+
+
+class GradingAttemptRepository(BaseRepository[GradingAttempt]):
+    """Persistence for :class:`GradingAttempt` run-history rows."""
+
+    model = GradingAttempt
+
+    async def pending_for_task(self, task_id: str) -> GradingAttempt | None:
+        """Fetch the open (PENDING) attempt of a task.
+
+        Args:
+            task_id: Owning task id.
+
+        Returns:
+            The newest pending attempt, or ``None``.
+        """
+        stmt = (
+            select(GradingAttempt)
+            .where(
+                GradingAttempt.task_id == task_id,
+                GradingAttempt.status == GradingAttemptStatus.PENDING,
+            )
+            .order_by(GradingAttempt.attempt_number.desc())
+            .limit(1)
+        )
+        return (await self.session.execute(stmt)).scalar_one_or_none()
+
+    async def latest_for_task(self, task_id: str) -> GradingAttempt | None:
+        """Fetch the newest attempt of a task regardless of status.
+
+        Args:
+            task_id: Owning task id.
+
+        Returns:
+            The latest attempt, or ``None``.
+        """
+        stmt = (
+            select(GradingAttempt)
+            .where(GradingAttempt.task_id == task_id)
+            .order_by(GradingAttempt.attempt_number.desc())
+            .limit(1)
+        )
+        return (await self.session.execute(stmt)).scalar_one_or_none()
+
+    async def list_for_task(self, task_id: str) -> list[GradingAttempt]:
+        """List a task's attempts in execution order.
+
+        Args:
+            task_id: Owning task id.
+
+        Returns:
+            Attempts oldest-first.
+        """
+        stmt = (
+            select(GradingAttempt)
+            .where(GradingAttempt.task_id == task_id)
+            .order_by(GradingAttempt.attempt_number.asc())
+        )
+        rows = (await self.session.execute(stmt)).scalars().all()
+        return list(rows)
 
 
 def utc_now() -> datetime:

@@ -1,21 +1,31 @@
 """Assignment routes: CRUD, questions, submissions, comments, batch grading."""
 
+from collections.abc import AsyncIterator
+from time import monotonic
 from typing import Annotated
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Request, Response
+from fastapi.responses import StreamingResponse
 
 from app.api.v1.deps import (
+    Container,
+    build_assignment_service,
     get_assessment_service,
     get_assignment_service,
     get_audit_service,
     get_batch_task_repo,
+    get_container,
     get_submission_repo,
 )
-from app.core.errors import ForbiddenError
+from app.core.db.engine import session_scope
+from app.core.errors import AppError, ForbiddenError
+from app.core.events import grading_task_channel
 from app.core.pagination import Page, PageParams, page_params
 from app.core.ratelimit.dependency import rate_limit
 from app.core.security.guards import CurrentUser, StaffUser
+from app.core.security.principal import UserPrincipal
+from app.domain.enums import BatchGradingTaskStatus
 from app.repositories.grading import SubmissionRepository
 from app.schemas.assessments import AttemptResponse
 from app.schemas.assignments import (
@@ -40,6 +50,23 @@ from app.services.audit import AuditService
 from app.services.files import FileService as _UnusedFiles  # noqa: F401
 
 router = APIRouter(prefix="/assignments", tags=["assignments"])
+
+STREAM_TICK_SECONDS = 3.0
+"""Safety-tick interval: re-read state even without published events."""
+STREAM_HEARTBEAT_SECONDS = 15.0
+"""Idle interval for SSE comment heartbeats (proxy keep-alive)."""
+STREAM_MAX_SECONDS = 60.0
+"""Connection lifetime cap (under the frontend gateway's 125s fetch timeout);
+clients reconnect transparently via EventSource."""
+TERMINAL_TASK_STATUSES = frozenset(
+    {
+        BatchGradingTaskStatus.COMPLETED,
+        BatchGradingTaskStatus.PARTIAL,
+        BatchGradingTaskStatus.FAILED,
+        BatchGradingTaskStatus.CANCELLED,
+    }
+)
+"""Task states that end progress streaming."""
 
 
 def _school(principal: object) -> str:
@@ -374,7 +401,37 @@ async def grade_all(
     task = await service.queue_grading(
         current_user, assignment_id, payload.mode if payload else "UNGRADED_ONLY"
     )
-    return BatchGradingTaskResponse.model_validate(task)
+    return service.present_grading(task)
+
+
+@router.post(
+    "/{assignment_id}/grading-tasks/{task_id}/retry",
+    response_model=BatchGradingTaskResponse,
+    summary="Retry a failed batch grading task (staff)",
+    dependencies=[Depends(rate_limit("5/minute"))],
+)
+async def retry_grading_task(
+    assignment_id: UUID,
+    task_id: UUID,
+    current_user: StaffUser,
+    service: Annotated[AssignmentService, Depends(get_assignment_service)],
+) -> BatchGradingTaskResponse:
+    """Requeue a terminally failed task with a fresh retry budget.
+
+    Args:
+        assignment_id: Assignment id.
+        task_id: Terminal grading task id.
+        current_user: Authenticated staff principal.
+        service: Assignment service (manageability check).
+
+    Returns:
+        The requeued task's state.
+
+    Raises:
+        ConflictError: When the task is still queued or running.
+    """
+    task = await service.retry_grading(current_user, assignment_id, task_id)
+    return service.present_grading(task)
 
 
 # ── Questions ────────────────────────────────────────────────────────────────
@@ -577,7 +634,152 @@ async def latest_grading_task(
 ) -> BatchGradingTaskResponse | None:
     """Read current or completed batch progress for a visible assignment."""
     task = await service.latest_grading(current_user, assignment_id)
-    return BatchGradingTaskResponse.model_validate(task) if task else None
+    return service.present_grading(task) if task else None
+
+
+def _sse_event(payload: str) -> str:
+    """Format one named SSE event carrying a task-state JSON payload.
+
+    Args:
+        payload: Serialized ``BatchGradingTaskResponse`` JSON.
+
+    Returns:
+        SSE frame text.
+    """
+    return f"event: task\ndata: {payload}\n\n"
+
+
+async def _latest_task_payload(
+    container: Container, principal: UserPrincipal, assignment_id: UUID
+) -> tuple[str | None, bool]:
+    """Read the latest task snapshot under the principal's permissions.
+
+    Opens a short-lived session per call (stream handlers must not hold a
+    request-scoped session across the response body) and routes the read
+    through the service so school scoping and staff checks stay authoritative.
+
+    Args:
+        container: App container (sessionmaker, settings).
+        principal: Authenticated staff principal captured at subscribe time.
+        assignment_id: Assignment id.
+
+    Returns:
+        Tuple of (serialized payload, terminal-status flag); ``None`` payload
+        when the task is gone or no longer visible.
+
+    Raises:
+        AppError: When the principal lost visibility of the assignment.
+    """
+    async with session_scope(container.sessionmaker) as session:
+        service = build_assignment_service(session, container)
+        task = await service.latest_grading(principal, assignment_id)
+        if task is None:
+            return None, True
+        payload = service.present_grading(task).model_dump_json(by_alias=True)
+        return payload, task.status in TERMINAL_TASK_STATUSES
+
+
+async def grading_task_stream(
+    *,
+    container: Container,
+    principal: UserPrincipal,
+    assignment_id: UUID,
+    initial_payload: str | None,
+    initial_terminal: bool,
+) -> AsyncIterator[str]:
+    """Yield SSE frames tracking an assignment's batch grading task.
+
+    Wake-ups come from pub/sub publishes on the assignment channel; a
+    periodic safety tick re-reads state anyway, covering missed events and
+    Redis unavailability (the broker degrades timeouts to ``None``). Every
+    emitted frame is a fresh authoritative DB read scoped to the subscriber.
+
+    Args:
+        container: App container.
+        principal: Authenticated staff principal captured at subscribe time.
+        assignment_id: Assignment id.
+        initial_payload: Pre-validated snapshot serialized by the route (or
+            ``None`` when no task exists yet).
+        initial_terminal: Whether the initial snapshot is terminal.
+
+    Yields:
+        SSE frames: ``event: task`` payloads and comment heartbeats.
+    """
+    if initial_payload is not None:
+        yield _sse_event(initial_payload)
+        if initial_terminal:
+            return
+    broker = container.task_event_broker()
+    channel = grading_task_channel(str(assignment_id))
+    await broker.subscribe(channel)
+    try:
+        deadline = monotonic() + STREAM_MAX_SECONDS
+        last_event = monotonic()
+        while monotonic() < deadline:
+            await broker.wait_for_event(channel, STREAM_TICK_SECONDS)
+            try:
+                payload, terminal = await _latest_task_payload(
+                    container, principal, assignment_id
+                )
+            except AppError:
+                # The subscriber lost visibility (assignment deleted/permission
+                # revoked): close the stream instead of erroring mid-response.
+                return
+            if payload is None:
+                return
+            if payload != initial_payload:
+                initial_payload = payload
+                last_event = monotonic()
+                yield _sse_event(payload)
+                if terminal:
+                    return
+            elif monotonic() - last_event >= STREAM_HEARTBEAT_SECONDS:
+                yield ": ping\n\n"
+                last_event = monotonic()
+    finally:
+        await broker.unsubscribe(channel)
+
+
+@router.get(
+    "/{assignment_id}/grading-task/stream",
+    response_model=None,
+    summary="Stream batch grading progress (staff, server-sent events)",
+    dependencies=[Depends(rate_limit("30/minute"))],
+)
+async def stream_grading_task(
+    assignment_id: UUID,
+    current_user: StaffUser,
+    service: Annotated[AssignmentService, Depends(get_assignment_service)],
+    container: Annotated[Container, Depends(get_container)],
+) -> StreamingResponse:
+    """Push batch grading task updates until the task is terminal.
+
+    The initial snapshot is validated with the request-scoped service so
+    authorization failures surface as HTTP errors before the stream opens;
+    subsequent frames are scoped re-reads inside the stream.
+
+    Args:
+        assignment_id: Assignment id.
+        current_user: Authenticated staff principal.
+        service: Assignment service (initial authorization + snapshot).
+        container: App container.
+
+    Returns:
+        A ``text/event-stream`` response.
+    """
+    task = await service.latest_grading(current_user, assignment_id)
+    payload = service.present_grading(task).model_dump_json(by_alias=True) if task else None
+    return StreamingResponse(
+        grading_task_stream(
+            container=container,
+            principal=current_user,
+            assignment_id=assignment_id,
+            initial_payload=payload,
+            initial_terminal=task is not None and task.status in TERMINAL_TASK_STATUSES,
+        ),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @router.get("/{assignment_id}/attempts", response_model=Page[AttemptResponse])

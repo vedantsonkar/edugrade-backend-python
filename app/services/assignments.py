@@ -29,8 +29,13 @@ from app.domain.users import User
 
 if TYPE_CHECKING:
     from sqlalchemy import Select
-from app.domain.enums import BatchGradingMode, BatchGradingTaskStatus, BatchGradingTrigger
-from app.domain.grading import BatchGradingTask
+from app.domain.enums import (
+    BatchGradingMode,
+    BatchGradingTaskStatus,
+    BatchGradingTrigger,
+    GradingAttemptStatus,
+)
+from app.domain.grading import BatchGradingTask, GradingAttempt
 from app.repositories.assignments import (
     AssignmentRepository,
     AssignmentTargetRepository,
@@ -40,6 +45,7 @@ from app.repositories.assignments import (
 from app.repositories.grading import (
     AttachmentRepository,
     BatchGradingTaskRepository,
+    GradingAttemptRepository,
     SubmissionRepository,
 )
 from app.repositories.taxonomy import ClassroomRepository
@@ -54,6 +60,7 @@ from app.schemas.assignments import (
     SubmissionGradeRequest,
     SubmissionResponse,
 )
+from app.schemas.grading import BatchGradingTaskResponse
 
 
 class AssignmentService:
@@ -71,6 +78,8 @@ class AssignmentService:
         classrooms: ClassroomRepository,
         clock: Clock,
         tasks: BatchGradingTaskRepository,
+        attempts: GradingAttemptRepository,
+        max_attempts: int = 5,
     ) -> None:
         """Inject repositories and the clock.
 
@@ -84,6 +93,9 @@ class AssignmentService:
             classrooms: Classroom repository (target validation).
             clock: Time source.
             tasks: Batch grading persistence.
+            attempts: Grading-attempt persistence.
+            max_attempts: Retry budget (total executions) surfaced in the
+                task projection.
         """
         self._assignments = assignments
         self._targets = targets
@@ -94,6 +106,8 @@ class AssignmentService:
         self._classrooms = classrooms
         self._clock = clock
         self._tasks = tasks
+        self._attempts = attempts
+        self._max_attempts = max(1, max_attempts)
 
     # ── Queries ──────────────────────────────────────────────────────────
 
@@ -117,7 +131,7 @@ class AssignmentService:
         await self._tasks.lock_assignment(assignment_id)
         if await self._tasks.active_for_assignment(str(assignment_id)) is not None:
             raise ConflictError("A grading task is already queued or running.")
-        return await self._tasks.add(
+        task = await self._tasks.add(
             BatchGradingTask(
                 assignment_id=str(assignment_id),
                 school_id=str(principal.school_id),
@@ -127,6 +141,78 @@ class AssignmentService:
                 created_by_id=str(principal.id),
             )
         )
+        await self._attempts.add(
+            GradingAttempt(task_id=str(task.id), attempt_number=1)
+        )
+        # Load the attempts collection eagerly so wire serialization never
+        # triggers a lazy load outside the async session context.
+        await self._tasks.session.refresh(task, ["attempts"])
+        return task
+
+    async def retry_grading(
+        self, principal: UserPrincipal, assignment_id: UUID, task_id: UUID
+    ) -> BatchGradingTask:
+        """Requeue a terminally failed task with a fresh retry budget.
+
+        The task returns to QUEUED immediately; the worker re-grades only
+        submissions still missing a grade, so results applied before the
+        failure are preserved.
+
+        Args:
+            principal: Authenticated staff caller.
+            assignment_id: Owning assignment.
+            task_id: Terminal task to retry.
+
+        Returns:
+            The requeued task.
+
+        Raises:
+            ConflictError: If the task is still queued or running.
+            NotFoundError: When the task is not in the assignment.
+            ForbiddenError: If the caller cannot manage the assignment.
+        """
+        await self._require_manageable(principal, assignment_id)
+        task = await self._tasks.get(task_id)
+        if task is None or str(task.assignment_id) != str(assignment_id):
+            raise NotFoundError("Grading task not found.")
+        if task.status not in (
+            BatchGradingTaskStatus.FAILED,
+            BatchGradingTaskStatus.PARTIAL,
+        ):
+            raise ConflictError("Only failed or partially failed tasks can be retried.")
+        attempts = self._attempts
+        pending = await attempts.pending_for_task(str(task.id))
+        if pending is not None:
+            # Defensive: a terminal task should never hold an open attempt.
+            pending.status = GradingAttemptStatus.FAILED
+            pending.error_message = pending.error_message or "Superseded by manual retry."
+            pending.completed_at = self._clock.now()
+        latest = await attempts.latest_for_task(str(task.id))
+        next_number = (latest.attempt_number + 1) if latest else 1
+        task.retry_count = 0
+        task.status = BatchGradingTaskStatus.QUEUED
+        task.next_retry_at = None
+        task.error_message = None
+        task.completed_at = None
+        task.gemini_job_name = None
+        task.gemini_input_file_name = None
+        task.gemini_output_file_name = None
+        await attempts.add(GradingAttempt(task_id=str(task.id), attempt_number=next_number))
+        await self._tasks.session.flush()
+        await self._tasks.session.refresh(task, ["attempts"])
+        return task
+
+    def present_grading(self, task: BatchGradingTask) -> BatchGradingTaskResponse:
+        """Project a task and its attempts into the wire schema.
+
+        Args:
+            task: Task with attempts eager-loaded.
+
+        Returns:
+            The response payload carrying the configured retry budget.
+        """
+        response = BatchGradingTaskResponse.model_validate(task)
+        return response.model_copy(update={"max_attempts": self._max_attempts})
 
     async def latest_grading(
         self, principal: UserPrincipal, assignment_id: UUID

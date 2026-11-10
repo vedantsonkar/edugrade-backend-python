@@ -91,6 +91,11 @@ def build_app(container: Container) -> FastAPI:
         batch_client=container.batch_llm,
         clock=container.clock,
         ids=container.ids,
+        max_attempts=container.settings.grading_retry_max_attempts,
+        fast_retries=container.settings.grading_retry_fast_retries,
+        backoff_base_seconds=container.settings.grading_retry_backoff_base_seconds,
+        backoff_cap_seconds=container.settings.grading_retry_backoff_cap_seconds,
+        events=container.task_event_broker(),
     )
     app.state.audit_archiver = AuditArchiver(
         sessionmaker=container.sessionmaker,

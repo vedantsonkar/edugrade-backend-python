@@ -31,6 +31,8 @@ Google login requires a registered, active student account that permits Google a
 - `GET /admin/audit/archives`: school-scoped object metadata.
 - `GET /assignments/{id}/attempts`: paginated, answer-free results; students receive only their own attempts.
 - `GET /assignments/{id}/grading-task`: latest batch task for authorized staff.
+- `GET /assignments/{id}/grading-task/stream`: server-sent events (`text/event-stream`) pushing batch task snapshots to authorized staff. The worker publishes state transitions over Redis pub/sub; the stream wakes on publish with a 3s safety tick, emits `event: task` frames carrying the `BatchGradingTaskResponse` JSON, sends comment heartbeats when idle, closes on a terminal status, and caps connections at 60s (clients reconnect transparently via `EventSource`).
+- `POST /assignments/{id}/grading-tasks/{taskId}/retry`: requeue a terminally failed or partially failed batch task with a fresh retry budget (staff, manageability enforced; 409 while the task is queued/running).
 - Assignment responses include `state`, `submissionCount`, `mySubmission`, and `myAttempt`; lists apply role-specific state filters before pagination.
 - Submission listing permits caller-owned student history. Teacher result views keep file submissions and online attempts separate.
 - Attempt grading accepts `questionOverrides` and nullable `gradeOverride`; points must remain within the assessment's limits. Teacher review includes student identity and temporary snapshot URLs. Unreleased results are hidden across student endpoints.
@@ -49,6 +51,10 @@ GET /api/v1/cron/archive?key=<secret>
 ```
 
 Grading requires Gemini configuration. Missing AI credentials produce an explicit error for direct grading; free-text assessment answers remain pending for manual grading. Queued batch work requires a configured worker pass. No worker or AI credential is needed in the frontend.
+
+### Batch grading retries
+
+Failed batch grading runs are retried automatically. Each execution is recorded as a `grading_attempts` row with status `PENDING`, `SUCCESS`, or `FAILED`; task responses expose the run history in `attempts` plus `retryCount`, `maxAttempts`, and `nextRetryAt`. Retryable failures (start errors, poll errors, provider job failures, per-submission failures) requeue the task as `QUEUED` within the same worker pass, so progress polling never observes a transient `FAILED` state. The first `GRADING_RETRY_FAST_RETRIES` (default 2) retries run on the next worker pass; later retries wait out an exponential backoff (`GRADING_RETRY_BACKOFF_BASE_SECONDS` × 2^(retry − fast − 1), capped at `GRADING_RETRY_BACKOFF_CAP_SECONDS`). After `GRADING_RETRY_MAX_ATTEMPTS` (default 5) total executions the task is terminal: `FAILED` for hard failures, `PARTIAL` when some submissions were graded. Retried tasks re-grade only submissions still missing a grade, preserving results applied before the failure.
 
 ```powershell
 python -m ruff check app tests scripts

@@ -110,3 +110,11 @@ class BatchGradingTaskStatus(StrEnum):
     PARTIAL = "PARTIAL"
     FAILED = "FAILED"
     CANCELLED = "CANCELLED"
+
+
+class GradingAttemptStatus(StrEnum):
+    """Lifecycle of a single execution of a batch grading task."""
+
+    PENDING = "PENDING"
+    SUCCESS = "SUCCESS"
+    FAILED = "FAILED"
