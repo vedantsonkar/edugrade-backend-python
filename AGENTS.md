@@ -45,9 +45,15 @@ doubt, look at how existing modules apply them.
     `mcq_multiple`, `true_false`, `free_text`).
   - `OcrProvider` — registry of named providers (`glm`, `off`); add `vision` by
     adding a class + registry entry, nothing else changes.
+  - `LlmGrader` + `BatchGradingClient` — grading providers as a named registry
+    (`gemini`, `openai`; built by `services/ai/registry.py`, resolved via
+    `settings.grading_provider`). Both adapters emit their wire schema from the
+    Pydantic models in `services/ai/schema.py` (single source of truth) and
+    validate responses with the same models. Add a provider = one builder
+    branch + settings keys; the worker and services never change.
   - `ObjectStorage` — SeaweedFS/S3 today; any object store tomorrow.
   - `RateLimiter` — Redis today, in-memory for tests/dev.
-  - `PasswordHasher`, `TokenService`, `IdProvider`, `Clock`, `LlmGrader` — all protocols.
+  - `PasswordHasher`, `TokenService`, `IdProvider`, `Clock` — all protocols.
 - Adding a question type = adding one strategy class + registering it. You must
   not need to touch the submit workflow.
 

@@ -13,14 +13,14 @@ class SchoolBrandingResponse(BaseSchema):
     Attributes:
         id: School id.
         name: Display name.
-        subdomain: URL subdomain.
+        school_key: Public school key.
         primary_color: Brand hex color.
         logo_url: Logo storage key, if any.
     """
 
     id: IdStr
     name: str
-    subdomain: str
+    school_key: str
     primary_color: str
     logo_url: str | None = None
     logo_download_url: str | None = None
@@ -31,13 +31,13 @@ class ValidateAdminRequest(BaseRequest):
 
     Attributes:
         admin_key: The school's onboarding secret.
-        school_id: School to validate against (either this or subdomain).
-        subdomain: Subdomain to resolve the school from.
+        school_id: School to validate against (either this or school key).
+        school_key: School key to resolve the school from.
     """
 
     admin_key: str = Field(min_length=1)
     school_id: IdStr | None = None
-    subdomain: str | None = None
+    school_key: str | None = None
 
 
 class ValidateAdminResponse(BaseSchema):
@@ -79,13 +79,13 @@ class SchoolRefreshResponse(BaseSchema):
         school_name: Display name.
         school_primary_color: Brand color.
         school_logo_url: Logo storage key.
-        school_subdomain: Subdomain.
+        school_key: School key.
     """
 
     school_name: str
     school_primary_color: str
     school_logo_url: str | None = None
-    school_subdomain: str
+    school_key: str
 
 
 class SchoolSettingsResponse(BaseSchema):
@@ -94,7 +94,7 @@ class SchoolSettingsResponse(BaseSchema):
     Attributes:
         id: School id.
         name: Display name.
-        subdomain: Subdomain.
+        school_key: School key.
         primary_color: Brand color.
         logo_url: Logo storage key.
         phone_country_code: Contact country code.
@@ -108,7 +108,7 @@ class SchoolSettingsResponse(BaseSchema):
 
     id: IdStr
     name: str
-    subdomain: str
+    school_key: str
     primary_color: str
     logo_url: str | None = None
     phone_country_code: str | None = None
@@ -132,7 +132,7 @@ class SchoolSettingsUpdate(BaseRequest):
 
     Attributes:
         name: New display name.
-        subdomain: New subdomain (uniqueness enforced).
+        school_key: New school key (uniqueness enforced).
         primary_color: New brand color.
         logo_url: New logo storage key.
         phone_country_code / phone_number: Contact updates.
@@ -143,7 +143,7 @@ class SchoolSettingsUpdate(BaseRequest):
     """
 
     name: str | None = Field(default=None, max_length=255)
-    subdomain: str | None = Field(default=None, max_length=63)
+    school_key: str | None = Field(default=None, max_length=63)
     primary_color: str | None = Field(default=None, max_length=9)
     logo_url: str | None = Field(default=None, max_length=512)
     phone_country_code: str | None = Field(default=None, max_length=8)

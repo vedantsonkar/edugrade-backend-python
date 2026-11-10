@@ -185,7 +185,7 @@ async def seeded_ids(
     async with session_scope(db_sessionmaker) as session:
         school = School(
             name="Test Academy",
-            subdomain="test-academy",
+            school_key="test-academy",
             admin_key="test-admin-key",
         )
         session.add(school)
@@ -263,6 +263,6 @@ def principal_for(ids: dict[str, str], role: UserRole) -> UserPrincipal:
         role=role.value,
         school_id=ids["school"],
         school_name="Test Academy",
-        school_subdomain="test-academy",
+        school_key="test-academy",
         enable_logging=True,
     )

@@ -58,7 +58,7 @@ class LoginResult:
             role=self.user.role.value,
             school_id=str(self.school.id),
             school_name=self.school.name,
-            school_subdomain=self.school.subdomain,
+            school_key=self.school.school_key,
             enable_logging=self.enable_logging,
         )
 
@@ -127,8 +127,9 @@ class AuthService:
         Raises:
             UnauthorizedError: On unknown email, bad password, deactivated
                 account, or credentials login not permitted.
-            ForbiddenError: When a student attempts the admin portal, or a
-                staff account logs in without a matching admin key.
+            ForbiddenError: When a student attempts the admin portal, a staff
+                account logs in without a matching admin key, or the school
+                has been disabled.
             ConflictError: When the school context mismatches.
         """
         user = await self._users.get_by_email(email.strip())
@@ -149,6 +150,8 @@ class AuthService:
         school = user.school
         if school is None:
             raise NotFoundError("User's school could not be loaded.")
+        if not school.is_available:
+            raise ForbiddenError("This school is no longer available.")
 
         if user.role.value != "STUDENT":
             if not admin_key:
@@ -199,7 +202,7 @@ class AuthService:
         if user is None or not user.is_active:
             raise UnauthorizedError("Account is unavailable.")
         school = user.school
-        if school is None:
+        if school is None or not school.is_available:
             raise UnauthorizedError("Account's school is unavailable.")
         config = school.config
         enable_logging = bool(config.enable_logging) if config else False
@@ -241,11 +244,15 @@ class AuthService:
             The user entity.
 
         Raises:
-            UnauthorizedError: If the account no longer exists or is inactive.
+            UnauthorizedError: If the account no longer exists, is inactive,
+                or its school is unavailable.
         """
         user = await self._users.get(user_id)
         if user is None or not user.is_active:
             raise UnauthorizedError("Account is unavailable.")
+        school = user.school
+        if school is None or not school.is_available:
+            raise UnauthorizedError("Account's school is unavailable.")
         return user
 
     async def _issue(self, user: User, school: School, enable_logging: bool) -> LoginResult:
@@ -266,7 +273,7 @@ class AuthService:
             role=user.role.value,
             school_id=str(school.id),
             school_name=school.name,
-            school_subdomain=school.subdomain,
+            school_key=school.school_key,
             enable_logging=enable_logging,
         )
         access = self._tokens.create_access_token(principal)

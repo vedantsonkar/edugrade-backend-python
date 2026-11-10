@@ -3,11 +3,12 @@
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Response
+from fastapi import APIRouter, Depends, Request, Response
 
 from app.api.v1.deps import (
     get_assessment_service,
     get_assignment_service,
+    get_audit_service,
     get_batch_task_repo,
     get_submission_repo,
 )
@@ -35,7 +36,7 @@ from app.schemas.assignments import (
 from app.schemas.grading import BatchGradingTaskResponse, GradeAllRequest
 from app.services.assessments import AssessmentService
 from app.services.assignments import AssignmentService
-from app.services.audit import AuditService as _UnusedAudit  # noqa: F401
+from app.services.audit import AuditService
 from app.services.files import FileService as _UnusedFiles  # noqa: F401
 
 router = APIRouter(prefix="/assignments", tags=["assignments"])
@@ -109,20 +110,36 @@ async def list_assignments(
 async def create_assignment(
     payload: AssignmentCreate,
     current_user: StaffUser,
+    request: Request,
     service: Annotated[AssignmentService, Depends(get_assignment_service)],
+    audit: Annotated[AuditService, Depends(get_audit_service)],
 ) -> AssignmentResponse:
     """Create an assignment with classroom targets.
 
     Args:
         payload: Creation payload.
         current_user: Authenticated staff principal.
+        request: Incoming request (audit provenance).
         service: Assignment service.
+        audit: Audit service.
 
     Returns:
         The created assignment.
     """
-    _ = _school(current_user)
+    school_id = _school(current_user)
     assignment = await service.create_assignment(current_user, payload)
+    await audit.record_event(
+        school_id=school_id,
+        principal=current_user,
+        request=request,
+        action="ASSIGNMENT_CREATED",
+        resource=str(assignment.id),
+        details={
+            "title": assignment.title,
+            "type": str(assignment.type),
+            "targetClassIds": payload.class_ids,
+        },
+    )
     return AssignmentResponse.model_validate(assignment)
 
 
@@ -162,7 +179,9 @@ async def update_assignment(
     assignment_id: UUID,
     payload: AssignmentUpdate,
     current_user: StaffUser,
+    request: Request,
     service: Annotated[AssignmentService, Depends(get_assignment_service)],
+    audit: Annotated[AuditService, Depends(get_audit_service)],
 ) -> AssignmentResponse:
     """Apply a partial update to an assignment.
 
@@ -170,7 +189,9 @@ async def update_assignment(
         assignment_id: Assignment id.
         payload: Patch payload.
         current_user: Authenticated staff principal.
+        request: Incoming request (audit provenance).
         service: Assignment service.
+        audit: Audit service.
 
     Returns:
         The updated assignment.
@@ -179,7 +200,53 @@ async def update_assignment(
         ForbiddenError: When a non-creator teacher attempts the edit.
     """
     assignment = await service.update_assignment(current_user, assignment_id, payload)
+    await audit.record_event(
+        school_id=_school(current_user),
+        principal=current_user,
+        request=request,
+        action="ASSIGNMENT_UPDATED",
+        resource=str(assignment.id),
+        details={"fields": sorted(payload.model_dump(exclude_unset=True))},
+    )
     return AssignmentResponse.model_validate(assignment)
+
+
+@router.delete(
+    "/{assignment_id}",
+    status_code=204,
+    summary="Delete assignment (creator/admin)",
+)
+async def delete_assignment(
+    assignment_id: UUID,
+    current_user: StaffUser,
+    request: Request,
+    service: Annotated[AssignmentService, Depends(get_assignment_service)],
+    audit: Annotated[AuditService, Depends(get_audit_service)],
+) -> Response:
+    """Delete an assignment and all of its dependent rows.
+
+    Args:
+        assignment_id: Assignment id.
+        current_user: Authenticated staff principal.
+        request: Incoming request (audit provenance).
+        service: Assignment service.
+        audit: Audit service.
+
+    Returns:
+        Empty 204 response.
+
+    Raises:
+        ForbiddenError: When a non-creator teacher attempts the delete.
+    """
+    await service.delete_assignment(current_user, assignment_id)
+    await audit.record_event(
+        school_id=_school(current_user),
+        principal=current_user,
+        request=request,
+        action="ASSIGNMENT_DELETED",
+        resource=str(assignment_id),
+    )
+    return Response(status_code=204)
 
 
 @router.get(

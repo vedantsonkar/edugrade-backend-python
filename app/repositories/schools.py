@@ -11,16 +11,16 @@ class SchoolRepository(BaseRepository[School]):
 
     model = School
 
-    async def get_by_subdomain(self, subdomain: str) -> School | None:
-        """Fetch a school by its URL subdomain.
+    async def get_by_school_key(self, school_key: str) -> School | None:
+        """Fetch a school by its public school key.
 
         Args:
-            subdomain: Case-insensitive subdomain.
+            school_key: Case-insensitive key as typed by the user.
 
         Returns:
             The school, or ``None``.
         """
-        stmt = select(School).where(School.subdomain == subdomain.lower())
+        stmt = select(School).where(School.school_key == school_key.lower())
         return (await self.session.execute(stmt)).scalar_one_or_none()
 
     async def get_by_admin_key(self, admin_key: str) -> School | None:

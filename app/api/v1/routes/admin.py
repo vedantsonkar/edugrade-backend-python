@@ -6,13 +6,14 @@ All routes require the ADMIN role except the staff-visible listing endpoints.
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Response
+from fastapi import APIRouter, Depends, Request, Response
 
 from app.api.v1.deps import (
     get_admin_service,
     get_audit_service,
     get_school_repo,
     get_school_service,
+    get_user_repo,
 )
 from app.core.errors import ForbiddenError, NotFoundError
 from app.core.pagination import Page, PageParams, page_params
@@ -20,6 +21,7 @@ from app.core.ratelimit.dependency import rate_limit
 from app.core.security.guards import AdminUser, StaffUser
 from app.domain.users import User
 from app.repositories.schools import SchoolRepository
+from app.repositories.users import UserRepository
 from app.schemas.admin import (
     AdminStatsResponse,
     AuditArchiveResponse,
@@ -90,19 +92,35 @@ async def list_classes(
 async def create_class(
     payload: ClassroomCreate,
     current_user: AdminUser,
+    request: Request,
     service: Annotated[AdminService, Depends(get_admin_service)],
+    audit: Annotated[AuditService, Depends(get_audit_service)],
 ) -> ClassroomResponse:
     """Create a (grade, division) classroom.
 
     Args:
         payload: Classroom fields.
         current_user: Authenticated admin.
+        request: Incoming request (audit provenance).
         service: Admin service.
+        audit: Audit service.
 
     Returns:
         The created classroom.
     """
     classroom = await service.create_classroom(_school(current_user), payload)
+    await audit.record_event(
+        school_id=_school(current_user),
+        principal=current_user,
+        request=request,
+        action="CLASS_CREATED",
+        resource=str(classroom.id),
+        details={
+            "gradeId": payload.grade_id,
+            "divisionId": payload.division_id,
+            "academicYear": classroom.academic_year,
+        },
+    )
     return ClassroomResponse.model_validate(classroom)
 
 
@@ -115,7 +133,9 @@ async def update_class(
     class_id: UUID,
     payload: ClassroomUpdate,
     current_user: AdminUser,
+    request: Request,
     service: Annotated[AdminService, Depends(get_admin_service)],
+    audit: Annotated[AuditService, Depends(get_audit_service)],
 ) -> ClassroomResponse:
     """Assign or clear a classroom's class teacher.
 
@@ -123,12 +143,22 @@ async def update_class(
         class_id: Classroom id.
         payload: Update payload.
         current_user: Authenticated admin.
+        request: Incoming request (audit provenance).
         service: Admin service.
+        audit: Audit service.
 
     Returns:
         The updated classroom.
     """
     classroom = await service.update_classroom(_school(current_user), class_id, payload)
+    await audit.record_event(
+        school_id=_school(current_user),
+        principal=current_user,
+        request=request,
+        action="CLASS_TEACHER_ASSIGNED",
+        resource=str(classroom.id),
+        details={"classTeacherId": classroom.class_teacher_id},
+    )
     return ClassroomResponse.model_validate(classroom)
 
 
@@ -167,19 +197,31 @@ async def list_divisions(
 async def create_division(
     payload: DivisionCreate,
     current_user: AdminUser,
+    request: Request,
     service: Annotated[AdminService, Depends(get_admin_service)],
+    audit: Annotated[AuditService, Depends(get_audit_service)],
 ) -> DivisionResponse:
     """Create a division.
 
     Args:
         payload: Division fields.
         current_user: Authenticated admin.
+        request: Incoming request (audit provenance).
         service: Admin service.
+        audit: Audit service.
 
     Returns:
         The created division.
     """
     division = await service.create_division(_school(current_user), payload)
+    await audit.record_event(
+        school_id=_school(current_user),
+        principal=current_user,
+        request=request,
+        action="DIVISION_CREATED",
+        resource=str(division.id),
+        details={"name": division.name},
+    )
     return DivisionResponse.model_validate(division)
 
 
@@ -191,19 +233,30 @@ async def create_division(
 async def delete_division(
     division_id: UUID,
     current_user: AdminUser,
+    request: Request,
     service: Annotated[AdminService, Depends(get_admin_service)],
+    audit: Annotated[AuditService, Depends(get_audit_service)],
 ) -> Response:
     """Delete a division (classrooms cascade).
 
     Args:
         division_id: Division id.
         current_user: Authenticated admin.
+        request: Incoming request (audit provenance).
         service: Admin service.
+        audit: Audit service.
 
     Returns:
         Empty 204 response.
     """
     await service.delete_division(_school(current_user), division_id)
+    await audit.record_event(
+        school_id=_school(current_user),
+        principal=current_user,
+        request=request,
+        action="DIVISION_DELETED",
+        resource=str(division_id),
+    )
     return Response(status_code=204)
 
 
@@ -230,19 +283,31 @@ async def list_grades(
 async def create_grade(
     payload: GradeCreate,
     current_user: AdminUser,
+    request: Request,
     service: Annotated[AdminService, Depends(get_admin_service)],
+    audit: Annotated[AuditService, Depends(get_audit_service)],
 ) -> GradeResponse:
     """Create a grade.
 
     Args:
         payload: Grade fields.
         current_user: Authenticated admin.
+        request: Incoming request (audit provenance).
         service: Admin service.
+        audit: Audit service.
 
     Returns:
         The created grade.
     """
     grade = await service.create_grade(_school(current_user), payload)
+    await audit.record_event(
+        school_id=_school(current_user),
+        principal=current_user,
+        request=request,
+        action="GRADE_CREATED",
+        resource=str(grade.id),
+        details={"name": grade.name},
+    )
     return GradeResponse.model_validate(grade)
 
 
@@ -250,19 +315,30 @@ async def create_grade(
 async def delete_grade(
     grade_id: UUID,
     current_user: AdminUser,
+    request: Request,
     service: Annotated[AdminService, Depends(get_admin_service)],
+    audit: Annotated[AuditService, Depends(get_audit_service)],
 ) -> Response:
     """Delete a grade (classrooms cascade).
 
     Args:
         grade_id: Grade id.
         current_user: Authenticated admin.
+        request: Incoming request (audit provenance).
         service: Admin service.
+        audit: Audit service.
 
     Returns:
         Empty 204 response.
     """
     await service.delete_grade(_school(current_user), grade_id)
+    await audit.record_event(
+        school_id=_school(current_user),
+        principal=current_user,
+        request=request,
+        action="GRADE_DELETED",
+        resource=str(grade_id),
+    )
     return Response(status_code=204)
 
 
@@ -312,19 +388,31 @@ async def list_students(
 async def create_student(
     payload: StudentCreate,
     current_user: AdminUser,
+    request: Request,
     service: Annotated[AdminService, Depends(get_admin_service)],
+    audit: Annotated[AuditService, Depends(get_audit_service)],
 ) -> StudentResponse:
     """Create a student account.
 
     Args:
         payload: Student fields.
         current_user: Authenticated admin.
+        request: Incoming request (audit provenance).
         service: Admin service.
+        audit: Audit service.
 
     Returns:
         The created student.
     """
     student = await service.create_student(_school(current_user), payload)
+    await audit.record_event(
+        school_id=_school(current_user),
+        principal=current_user,
+        request=request,
+        action="STUDENT_CREATED",
+        resource=str(student.id),
+        details={"email": student.email, "name": student.name},
+    )
     return StudentResponse.model_validate(student)
 
 
@@ -337,7 +425,9 @@ async def update_student(
     student_id: UUID,
     payload: StudentUpdate,
     current_user: AdminUser,
+    request: Request,
     service: Annotated[AdminService, Depends(get_admin_service)],
+    audit: Annotated[AuditService, Depends(get_audit_service)],
 ) -> StudentResponse:
     """Apply a partial update to a student.
 
@@ -345,12 +435,22 @@ async def update_student(
         student_id: Student id.
         payload: Update payload.
         current_user: Authenticated admin.
+        request: Incoming request (audit provenance).
         service: Admin service.
+        audit: Audit service.
 
     Returns:
         The updated student.
     """
     student = await service.update_student(_school(current_user), student_id, payload)
+    await audit.record_event(
+        school_id=_school(current_user),
+        principal=current_user,
+        request=request,
+        action="STUDENT_UPDATED",
+        resource=str(student.id),
+        details={"fields": sorted(payload.model_dump(exclude_unset=True))},
+    )
     return StudentResponse.model_validate(student)
 
 
@@ -363,21 +463,25 @@ async def update_student(
 async def bulk_students(
     payload: BulkUserCsvRequest,
     current_user: AdminUser,
+    request: Request,
     service: Annotated[AdminService, Depends(get_admin_service)],
+    audit: Annotated[AuditService, Depends(get_audit_service)],
 ) -> BulkUserCsvResponse:
     """Import students from CSV (grade/division by name).
 
     Args:
         payload: CSV content + dry-run flag.
         current_user: Authenticated admin.
+        request: Incoming request (audit provenance).
         service: Admin service.
+        audit: Audit service.
 
     Returns:
         Per-row import outcome.
     """
     from app.domain.enums import UserRole
 
-    return await service.bulk_import_users(
+    result = await service.bulk_import_users(
         _school(current_user),
         payload.csv,
         dry_run=payload.dry_run,
@@ -385,6 +489,21 @@ async def bulk_students(
         operation=payload.operation,
         skip_invalid=payload.skip_invalid,
     )
+    if not payload.dry_run:
+        await audit.record_event(
+            school_id=_school(current_user),
+            principal=current_user,
+            request=request,
+            action="STUDENTS_IMPORTED",
+            details={
+                "operation": payload.operation,
+                "created": result.created,
+                "updated": result.updated,
+                "skipped": result.skipped,
+                "invalidRows": result.invalid_rows,
+            },
+        )
+    return result
 
 
 # ── Teachers ─────────────────────────────────────────────────────────────────
@@ -428,19 +547,31 @@ async def list_teachers(
 async def create_teacher(
     payload: TeacherCreate,
     current_user: AdminUser,
+    request: Request,
     service: Annotated[AdminService, Depends(get_admin_service)],
+    audit: Annotated[AuditService, Depends(get_audit_service)],
 ) -> TeacherCreatedResponse:
     """Create a teacher account.
 
     Args:
         payload: Teacher fields.
         current_user: Authenticated admin.
+        request: Incoming request (audit provenance).
         service: Admin service.
+        audit: Audit service.
 
     Returns:
         The created teacher.
     """
     teacher = await service.create_teacher(_school(current_user), payload)
+    await audit.record_event(
+        school_id=_school(current_user),
+        principal=current_user,
+        request=request,
+        action="TEACHER_CREATED",
+        resource=str(teacher.user.id),
+        details={"email": teacher.user.email, "name": teacher.user.name},
+    )
     return TeacherCreatedResponse(
         **TeacherResponse.model_validate(teacher.user).model_dump(),
         generated_password=teacher.generated_password,
@@ -456,7 +587,9 @@ async def update_teacher(
     teacher_id: UUID,
     payload: TeacherUpdate,
     current_user: AdminUser,
+    request: Request,
     service: Annotated[AdminService, Depends(get_admin_service)],
+    audit: Annotated[AuditService, Depends(get_audit_service)],
 ) -> TeacherResponse:
     """Apply a partial update to a teacher.
 
@@ -464,12 +597,22 @@ async def update_teacher(
         teacher_id: Teacher id.
         payload: Update payload.
         current_user: Authenticated admin.
+        request: Incoming request (audit provenance).
         service: Admin service.
+        audit: Audit service.
 
     Returns:
         The updated teacher.
     """
     teacher = await service.update_teacher(_school(current_user), teacher_id, payload)
+    await audit.record_event(
+        school_id=_school(current_user),
+        principal=current_user,
+        request=request,
+        action="TEACHER_UPDATED",
+        resource=str(teacher.id),
+        details={"fields": sorted(payload.model_dump(exclude_unset=True))},
+    )
     return TeacherResponse.model_validate(teacher)
 
 
@@ -482,21 +625,25 @@ async def update_teacher(
 async def bulk_teachers(
     payload: BulkUserCsvRequest,
     current_user: AdminUser,
+    request: Request,
     service: Annotated[AdminService, Depends(get_admin_service)],
+    audit: Annotated[AuditService, Depends(get_audit_service)],
 ) -> BulkUserCsvResponse:
     """Import teachers from CSV.
 
     Args:
         payload: CSV content + dry-run flag.
         current_user: Authenticated admin.
+        request: Incoming request (audit provenance).
         service: Admin service.
+        audit: Audit service.
 
     Returns:
         Per-row import outcome.
     """
     from app.domain.enums import UserRole
 
-    return await service.bulk_import_users(
+    result = await service.bulk_import_users(
         _school(current_user),
         payload.csv,
         dry_run=payload.dry_run,
@@ -504,6 +651,21 @@ async def bulk_teachers(
         operation=payload.operation,
         skip_invalid=payload.skip_invalid,
     )
+    if not payload.dry_run:
+        await audit.record_event(
+            school_id=_school(current_user),
+            principal=current_user,
+            request=request,
+            action="TEACHERS_IMPORTED",
+            details={
+                "operation": payload.operation,
+                "created": result.created,
+                "updated": result.updated,
+                "skipped": result.skipped,
+                "invalidRows": result.invalid_rows,
+            },
+        )
+    return result
 
 
 @router.post(
@@ -515,7 +677,9 @@ async def set_user_status(
     user_id: UUID,
     payload: UserStatusUpdate,
     current_user: AdminUser,
+    request: Request,
     service: Annotated[AdminService, Depends(get_admin_service)],
+    audit: Annotated[AuditService, Depends(get_audit_service)],
 ) -> StudentResponse:
     """Activate or deactivate any user in the school.
 
@@ -523,12 +687,22 @@ async def set_user_status(
         user_id: Target user.
         payload: New status.
         current_user: Authenticated admin.
+        request: Incoming request (audit provenance).
         service: Admin service.
+        audit: Audit service.
 
     Returns:
         The updated user (student-shaped projection).
     """
     user = await service.set_user_status(_school(current_user), user_id, payload.is_active)
+    await audit.record_event(
+        school_id=_school(current_user),
+        principal=current_user,
+        request=request,
+        action="USER_STATUS_CHANGED",
+        resource=str(user.id),
+        details={"isActive": payload.is_active, "role": str(user.role)},
+    )
     return StudentResponse.model_validate(user)
 
 
@@ -646,15 +820,17 @@ async def school_setup(
 async def audit_list(
     current_user: AdminUser,
     service: Annotated[AuditService, Depends(get_audit_service)],
+    users: Annotated[UserRepository, Depends(get_user_repo)],
     params: Annotated[PageParams, Depends(page_params)],
     action: str | None = None,
     userId: str | None = None,
 ) -> Page[AuditLogResponse]:
-    """List the school's audit events newest-first.
+    """List the school's audit events newest-first, with actor names resolved.
 
     Args:
         current_user: Authenticated admin.
         service: Audit service.
+        users: User repository (actor display resolution).
         params: Pagination window.
         action: Exact-action filter.
         userId: Acting-user filter.
@@ -663,8 +839,26 @@ async def audit_list(
         Paginated audit logs.
     """
     page = await service.list_events(_school(current_user), params, action=action, user_id=userId)
+    # Resolve acting users in one query; audit rows keep no FK so names must
+    # be joined at read time (and may be gone after user deletion).
+    actor_ids: list[UUID] = []
+    for log in page.items:
+        if log.user_id:
+            try:
+                actor_ids.append(UUID(log.user_id))
+            except ValueError:
+                continue
+    actors = {str(u.id): u for u in await users.get_by_ids(actor_ids)}
+    items: list[AuditLogResponse] = []
+    for log in page.items:
+        item = AuditLogResponse.model_validate(log)
+        actor = actors.get(log.user_id or "")
+        if actor is not None:
+            item.user_name = actor.name
+            item.user_email = actor.email
+        items.append(item)
     return Page[AuditLogResponse](
-        items=[AuditLogResponse.model_validate(log) for log in page.items],
+        items=items,
         page=page.page,
         page_size=page.page_size,
         total=page.total,
@@ -748,10 +942,31 @@ async def get_school_settings(
 async def patch_school_settings(
     payload: SchoolSettingsUpdate,
     current_user: AdminUser,
+    request: Request,
     service: Annotated[SchoolService, Depends(get_school_service)],
+    audit: Annotated[AuditService, Depends(get_audit_service)],
 ) -> SchoolSettingsResponse:
-    """Update the administrator's own school and feature configuration."""
+    """Update the administrator's own school and feature configuration.
+
+    Args:
+        payload: Settings patch.
+        current_user: Authenticated admin.
+        request: Incoming request (audit provenance).
+        service: School service.
+        audit: Audit service.
+
+    Returns:
+        The updated settings.
+    """
     school = await service.update_settings(_school(current_user), payload)
+    await audit.record_event(
+        school_id=_school(current_user),
+        principal=current_user,
+        request=request,
+        action="SCHOOL_SETTINGS_UPDATED",
+        resource=str(school.id),
+        details={"fields": sorted(payload.model_dump(exclude_unset=True))},
+    )
     return SchoolSettingsResponse.model_validate(school)
 
 

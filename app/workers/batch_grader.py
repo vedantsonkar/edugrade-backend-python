@@ -1,22 +1,25 @@
 """Background batch-grading worker.
 
 Implements the legacy prototype's state machine with its defects fixed:
-OCR honors the school's ``enable_vision_ocr`` config, request mappings are
-real (submission id → Gemini request key), and sessions are opened per pass
-(workers own no long-lived DB session). Flow:
+request mappings are real (submission id → request key), sessions are opened
+per pass (workers own no long-lived DB session), and results are applied
+through the shared applier with per-submission isolation. Flow:
 
 1. ``enqueue_due_date_assignments`` - due offline assignments with auto-grade
    become QUEUED tasks (deduped by ``auto_graded_at``).
-2. ``start_queued_grading_tasks`` - QUEUED → RUNNING: build JSONL request
-   payloads, upload to Gemini, create the batch job.
-3. ``poll_running_grading_tasks`` - RUNNING tasks poll Gemini; on success the
-   output JSONL is applied to submissions and tasks finalize
-   (COMPLETED/PARTIAL/FAILED).
+2. ``start_queued_grading_tasks`` - QUEUED → RUNNING: build batch requests,
+   hand them to the configured :class:`BatchGradingClient` provider.
+3. ``poll_running_grading_tasks`` - RUNNING tasks poll the provider; on
+   success per-request outcomes are applied to submissions and tasks
+   finalize (COMPLETED/PARTIAL/FAILED).
+
+The worker depends only on the provider-agnostic port: per-request failures
+(malformed model output, provider errors) are isolated as failed
+submissions and never abort the task.
 """
 
-import json
 import logging
-from typing import Any
+from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -29,8 +32,16 @@ from app.domain.enums import BatchGradingMode, BatchGradingTaskStatus, BatchGrad
 from app.domain.grading import BatchGradingTask, Submission
 from app.repositories.assignments import AssignmentRepository
 from app.repositories.grading import BatchGradingTaskRepository, SubmissionRepository
-from app.services.ai.llm import GRADING_RESPONSE_SCHEMA, BatchGeminiClient, build_grading_prompt
-from app.services.ai.ocr import OcrProvider, guess_mime, temporary_jsonl_path
+from app.services.ai.batching import (
+    TERMINAL_FAILURE_STATES,
+    AttachmentBlob,
+    BatchGradeRequest,
+    BatchGradingClient,
+    BatchJobState,
+)
+from app.services.ai.ocr import OcrProvider, guess_mime
+from app.services.ai.schema import build_grading_prompt
+from app.services.grading.apply import apply_grading_result
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +55,7 @@ class BatchGradingProcessor:
         sessionmaker: async_sessionmaker[AsyncSession],
         storage: ObjectStorage,
         ocr: OcrProvider,
-        gemini: BatchGeminiClient | None,
+        batch_client: BatchGradingClient | None,
         clock: Clock,
         ids: IdProvider,
     ) -> None:
@@ -53,15 +64,15 @@ class BatchGradingProcessor:
         Args:
             sessionmaker: Session factory (repos are built per pass).
             storage: Object storage (attachment downloads).
-            ocr: OCR provider (gated per school config).
-            gemini: Batch API adapter (``None`` disables processing).
+            ocr: OCR provider.
+            batch_client: Batch grading port (``None`` disables processing).
             clock: Time source.
             ids: Id provider (request keys).
         """
         self._sessionmaker = sessionmaker
         self._storage = storage
         self._ocr = ocr
-        self._gemini = gemini
+        self._batch = batch_client
         self._clock = clock
         self._ids = ids
 
@@ -105,13 +116,13 @@ class BatchGradingProcessor:
             return queued
 
     async def start_queued_grading_tasks(self) -> int:
-        """Launch QUEUED tasks: compile payloads and create Gemini jobs.
+        """Launch QUEUED tasks: compile batch requests and create jobs.
 
         Returns:
             Number of tasks started.
         """
-        if self._gemini is None:
-            logger.warning("Batch grading requested without Gemini config; skipping.")
+        if self._batch is None:
+            logger.warning("Batch grading requested without a provider; skipping.")
             return 0
         started = 0
         async with session_scope(self._sessionmaker) as session:
@@ -133,7 +144,7 @@ class BatchGradingProcessor:
         Returns:
             Number of tasks finalized.
         """
-        if self._gemini is None:
+        if self._batch is None:
             return 0
         finalized = 0
         async with session_scope(self._sessionmaker) as session:
@@ -153,28 +164,26 @@ class BatchGradingProcessor:
     # ── internals ────────────────────────────────────────────────────────
 
     async def _start_task(self, session: AsyncSession, task: BatchGradingTask) -> None:
-        """Compile a task's request payloads and create its Gemini batch.
+        """Compile a task's batch requests and create the provider job.
 
         Args:
             session: Open session owning this pass's transaction.
-            task: QUEUED task (mutated to RUNNING with Gemini bookkeeping).
+            task: QUEUED task (mutated to RUNNING with provider bookkeeping).
         """
-        assert self._gemini is not None
-        assignments = AssignmentRepository(session)
+        assert self._batch is not None
         submission_repo = SubmissionRepository(session)
         assignment = task.assignment
-        _ = assignments
         submissions, _total = await submission_repo.list_for_assignment(
             str(assignment.id),
             PageParams(page=1, page_size=1000),
             only_ungraded=task.mode is BatchGradingMode.UNGRADED_ONLY,
         )
         mappings: dict[str, str] = {}
-        lines: list[str] = []
+        requests: list[BatchGradeRequest] = []
         for index, submission in enumerate(submissions):
             request_key = f"req-{index}-{self._ids.new_id().hex[:8]}"
             mappings[request_key] = str(submission.id)
-            ocr_texts, inline = await self._collect_attachment_context(submission)
+            ocr_texts, blobs = await self._collect_attachment_context(submission)
             prompt = build_grading_prompt(
                 {
                     "subject": assignment.subject,
@@ -189,48 +198,30 @@ class BatchGradingProcessor:
                 },
                 ocr_texts,
             )
-            contents: list[dict[str, Any]] = [{"text": prompt}]
-            for part in inline:
-                contents.append(part)
-            request_payload = {
-                "key": request_key,
-                "request": {
-                    "contents": [{"parts": contents}],
-                    "generationConfig": {
-                        "responseMimeType": "application/json",
-                        "responseSchema": GRADING_RESPONSE_SCHEMA,
-                    },
-                },
-            }
-            lines.append(json.dumps(request_payload))
+            requests.append(BatchGradeRequest(key=request_key, prompt=prompt, files=tuple(blobs)))
 
-        path = temporary_jsonl_path(str(task.id))
-        path.write_text("\n".join(lines), encoding="utf-8")
-        input_file = await self._gemini.upload_jsonl(path)
-        job_name = await self._gemini.create_batch(input_file)
+        handle = await self._batch.create_job(requests)
 
         task.status = BatchGradingTaskStatus.RUNNING
         task.started_at = self._clock.now()
-        task.total_submissions = len(submissions)
+        task.total_submissions = len(requests)
         task.request_mappings = dict(mappings)
-        task.gemini_job_name = job_name
-        task.gemini_input_file_name = input_file
+        task.gemini_job_name = handle.job_name
+        task.gemini_input_file_name = handle.input_ref
 
     async def _collect_attachment_context(
         self, submission: Submission
-    ) -> tuple[list[str], list[dict[str, object]]]:
-        """Download attachments and split them into OCR text vs inline parts.
+    ) -> tuple[list[str], list[AttachmentBlob]]:
+        """Download attachments and split them into OCR text vs raw blobs.
 
         Args:
             submission: Submission whose attachments to fetch.
 
         Returns:
-            Tuple of (ocr texts, inline base64 parts).
+            Tuple of (OCR texts, attachment blobs for provider inlining).
         """
-        import base64
-
         ocr_texts: list[str] = []
-        inline: list[dict[str, object]] = []
+        blobs: list[AttachmentBlob] = []
         for attachment in submission.attachments:
             try:
                 data = await self._storage.get_bytes(attachment.url)
@@ -242,15 +233,8 @@ class BatchGradingProcessor:
             if ocr.text:
                 ocr_texts.append(ocr.text)
                 continue
-            inline.append(
-                {
-                    "inline_data": {
-                        "mime_type": mime,
-                        "data": base64.b64encode(data).decode(),
-                    }
-                }
-            )
-        return ocr_texts, inline
+            blobs.append(AttachmentBlob(data=data, mime_type=mime))
+        return ocr_texts, blobs
 
     async def _poll_task(
         self,
@@ -258,7 +242,11 @@ class BatchGradingProcessor:
         submissions: SubmissionRepository,
         task: BatchGradingTask,
     ) -> bool:
-        """Poll one RUNNING task; apply output when the job succeeded.
+        """Poll one RUNNING task; apply outcomes when the job succeeded.
+
+        Per-request failures are isolated: each unparseable or errored
+        response fails only its own submission (recorded in
+        ``failure_details``); requests with no response are failed too.
 
         Args:
             session: Open session owning this pass's transaction.
@@ -268,92 +256,57 @@ class BatchGradingProcessor:
         Returns:
             ``True`` when the task reached a terminal state this pass.
         """
-        assert self._gemini is not None
+        assert self._batch is not None
         assert task.gemini_job_name is not None
-        state, output_file = await self._gemini.get_batch_state(task.gemini_job_name)
-        if state.upper() not in ("SUCCEEDED", "JOB_STATE_SUCCEEDED"):
-            terminal_failure = any(
-                marker in state.upper() for marker in ("FAILED", "CANCELLED", "EXPIRED")
-            )
-            if terminal_failure:
+        snapshot = await self._batch.poll(task.gemini_job_name)
+        if snapshot.state is not BatchJobState.SUCCEEDED:
+            if snapshot.state in TERMINAL_FAILURE_STATES:
                 task.status = BatchGradingTaskStatus.FAILED
-                task.error_message = f"Gemini job state: {state}"
+                task.error_message = f"Provider job state: {snapshot.state.value}" + (
+                    f" ({snapshot.error})" if snapshot.error else ""
+                )
                 task.completed_at = self._clock.now()
                 return True
             return False
 
         mappings = {k: str(v) for k, v in (task.request_mappings or {}).items()}
-        output = await self._gemini.download_output(output_file or "")
-        graded = failed = 0
-        for line in output.decode("utf-8").splitlines():
-            if not line.strip():
-                continue
-            entry: dict[str, Any] = json.loads(line)
-            submission_id = mappings.get(str(entry.get("key", "")))
+        outcomes = await self._batch.collect(task.gemini_job_name, snapshot)
+        graded = 0
+        failures: list[object] = []
+        answered: set[str] = set()
+        for outcome in outcomes:
+            submission_id = mappings.get(outcome.key)
             if submission_id is None:
+                logger.warning("Ignoring outcome for unknown key %s", outcome.key)
                 continue
-            response = entry.get("response", {})
-            text = _extract_response_text(response)
-            if text is None:
-                failed += 1
+            if outcome.key in answered:
+                logger.warning("Duplicate outcome for key %s ignored", outcome.key)
                 continue
-            parsed = json.loads(_strip_fences(text))
-            from uuid import UUID
-
+            answered.add(outcome.key)
             submission = await submissions.get(UUID(submission_id))
             if submission is None:
-                failed += 1
+                failures.append({"key": outcome.key, "error": "submission not found"})
                 continue
-            submission.grade = float(parsed.get("score", 0))
-            submission.ai_summary = str(parsed.get("summary", ""))
-            submission.ai_feedback = str(parsed.get("feedback", ""))
-            if parsed.get("plagiarismScore") is not None:
-                submission.plagiarism_score = float(parsed["plagiarismScore"])
-            if parsed.get("plagiarismAnalysis") is not None:
-                submission.plagiarism_analysis = str(parsed["plagiarismAnalysis"])
+            if outcome.result is None:
+                failures.append({"key": outcome.key, "error": outcome.error})
+                continue
+            apply_grading_result(submission, outcome.result)
             graded += 1
+
+        failed = len(mappings) - graded
+        failures.extend(
+            {"key": key, "error": "no response"} for key in sorted(set(mappings) - answered)
+        )
 
         task.graded_submissions = graded
         task.failed_submissions = failed
         task.processed_submissions = graded + failed
+        task.failure_details = failures or None
         task.status = (
             BatchGradingTaskStatus.COMPLETED if failed == 0 else BatchGradingTaskStatus.PARTIAL
         )
         task.completed_at = self._clock.now()
+        task.gemini_output_file_name = snapshot.output_ref
 
-        await self._gemini.delete_file(task.gemini_input_file_name or "")
-        if output_file:
-            await self._gemini.delete_file(output_file)
+        await self._batch.dispose(task.gemini_job_name, task.gemini_input_file_name, snapshot)
         return True
-
-
-def _extract_response_text(response: dict[str, Any]) -> str | None:
-    """Pull the assistant text out of a Gemini batch response entry.
-
-    Args:
-        response: ``response`` object from the JSONL line.
-
-    Returns:
-        The text, or ``None`` when absent.
-    """
-    candidates = response.get("candidates") or []
-    if not candidates:
-        return None
-    parts = (candidates[0].get("content") or {}).get("parts") or []
-    texts = [str(p.get("text", "")) for p in parts if isinstance(p, dict)]
-    joined = "".join(texts).strip()
-    return joined or None
-
-
-def _strip_fences(text: str) -> str:
-    """Strip markdown fences from model output.
-
-    Args:
-        text: Raw text.
-
-    Returns:
-        Cleaned JSON text.
-    """
-    import re
-
-    return re.sub(r"^```(?:json)?\s*|\s*```$", "", text.strip(), flags=re.MULTILINE)

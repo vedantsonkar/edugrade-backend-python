@@ -10,7 +10,7 @@ Last checked: **7 November 2026**. These are local development and test credenti
 | Frontend, Hindi | http://localhost:3000/hi |
 | Python API | http://localhost:8000/api/v1 |
 | School | Demo Academy |
-| School subdomain | `demo-school` |
+| School key | `demo-school` |
 | Admin / teacher tab key | `demo-admin-key` |
 
 The Python seed creates **Demo Academy (`demo-school`)** and **Demo Academy 2 (`demo-school-2`)**. Each school has four active accounts with separate identities and data. The seed does not reset existing accounts or passwords. Both schools are present in the current local database. All eight logins and cross-school access restrictions were verified through the frontend gateway on the date above.
@@ -26,14 +26,12 @@ The Python seed creates **Demo Academy (`demo-school`)** and **Demo Academy 2 (`
 
 ### How to log in
 
-1. Open the English or Hindi frontend URL above.
+1. Open the English or Hindi frontend URL above and enter the school key `demo-school` (or deep-link with `?schoolKey=demo-school`). The key is remembered across visits; use the "Switch school" link to change it.
 2. For a student, use the **Student** tab and the student's email and password.
 3. For a teacher or admin, select the **Admin** tab, enter `demo-admin-key` when prompted, then enter the staff member's email and password.
 4. Log out before switching accounts, especially when switching roles or schools.
 
 The school admin key unlocks the staff login tab and is sent with the staff login request; the API rejects any teacher/admin login without a matching key, so the account password alone is never enough. Teachers also use this tab. Staff accounts are rejected on the student portal, and student accounts are rejected on the staff portal.
-
-The development frontend selects its school using `NEXT_PUBLIC_DEV_HOSTNAME` in `.env.local`, currently `demo-school`. Restart the frontend after changing this value. Changing the URL alone does not select a different school while this development override is in use.
 
 ### Seed command
 
@@ -53,7 +51,7 @@ The Python seeder creates both schools independently. If one already exists, it 
 
 ## Demo Academy 2 accounts — available now
 
-School subdomain: `demo-school-2` · Admin / teacher tab key: `demo-admin-key-2`
+School key: `demo-school-2` · Admin / teacher tab key: `demo-admin-key-2` · Deep link: http://localhost:3000/en?schoolKey=demo-school-2
 
 | Role | Name | Email / login | Password | Student class |
 | --- | --- | --- | --- | --- |
@@ -66,13 +64,13 @@ Names and class labels deliberately match the first school's examples, while use
 
 ## Demonstrate data isolation
 
-1. Set `NEXT_PUBLIC_DEV_HOSTNAME=demo-school` in the frontend's `.env.local` and start the frontend. Sign in as `teacher@demo-school.edu` or `student2@demo-school.edu`. Confirm the school is Demo Academy and its quiz is visible. Record that quiz's assignment ID from its URL.
-2. Log out. Change `.env.local` to `NEXT_PUBLIC_DEV_HOSTNAME=demo-school-2` and restart the frontend. Open http://localhost:3000/en or http://localhost:3000/hi. Confirm the school is Demo Academy 2 with green branding.
+1. Open http://localhost:3000/en, enter the school key `demo-school`, and start the frontend session. Sign in as `teacher@demo-school.edu` or `student2@demo-school.edu`. Confirm the school is Demo Academy and its quiz is visible. Record that quiz's assignment ID from its URL.
+2. Log out, use the **Switch school** link (or open http://localhost:3000/en?schoolKey=demo-school-2), and confirm the school is Demo Academy 2 with green branding.
 3. Try the first school's student login on this second school's login page: it must be rejected because the account belongs to a different school. Its admin key `demo-admin-key` must also fail on the second school's Admin tab.
 4. Sign in with `student2@demo-school-2.edu` / `20090102`. Only this school's targeted assignments should appear. Opening the first school's assignment ID must return a not-found response and reveal no assignment data.
 5. Log out and use the second school's Admin tab with `demo-admin-key-2`, then `admin@demo-school-2.edu` / `Admin@123`. Its user lists should contain only its own two students and one teacher, unless more users were added there.
 6. Repeat in the opposite direction: a second-school account/key cannot log in on the first school's portal, and a first-school session cannot access the second school's assignment.
-7. Restore `NEXT_PUBLIC_DEV_HOSTNAME=demo-school` and restart when finished.
+7. Switch back to the `demo-school` key when finished.
 
 Existing local smoke-test records may make the first school's lists longer. Those records remain scoped to that school. Creating, editing, or submitting work in either tenant should affect only that tenant.
 
@@ -84,7 +82,7 @@ These accounts exist only in isolated, temporary pytest databases. They are not 
 
 ### Test Academy
 
-Subdomain: `test-academy` · Admin / teacher tab key: `test-admin-key`
+School key: `test-academy` · Admin / teacher tab key: `test-admin-key`
 
 | Role | Name | Email / login | Password |
 | --- | --- | --- | --- |
@@ -104,7 +102,7 @@ The pagination test also creates `bulk0@test.edu` through `bulk24@test.edu` with
 
 ### Other School — tenant-isolation fixture
 
-Subdomain: `other-school` · Admin key: `other`. The Google login test creates this school without any users. `unknown@test.edu` is deliberately unregistered and is expected to fail authentication.
+School key: `other-school` · Admin key: `other`. The Google login test creates this school without any users. `unknown@test.edu` is deliberately unregistered and is expected to fail authentication.
 
 ## Password and SSO notes
 

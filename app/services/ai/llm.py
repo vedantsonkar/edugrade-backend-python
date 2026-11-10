@@ -1,40 +1,49 @@
-"""AI adapter layer: Gemini LLM grader (direct and batch)."""
+"""AI adapter layer: Gemini LLM grader (direct and batch).
+
+Implements the provider-agnostic grading contract from
+:mod:`app.services.ai.schema` and the :class:`BatchGradingClient` port from
+:mod:`app.services.ai.batching`. ``google-genai`` is imported only inside
+this module (adapter boundary, AGENTS.md §2-D).
+"""
 
 import base64
 import json
 import logging
-import re
-from dataclasses import dataclass
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
 from app.core.config import Settings
 from app.core.errors import ExternalServiceError
+from app.services.ai.batching import (
+    BatchGradeOutcome,
+    BatchGradeRequest,
+    BatchJobHandle,
+    BatchJobSnapshot,
+    BatchJobState,
+)
+from app.services.ai.schema import (
+    GradingResult,
+    build_free_text_prompt,
+    build_grading_prompt,
+    free_text_response_schema,
+    grading_response_schema,
+    parse_free_text_text,
+    parse_grading_text,
+)
 
 logger = logging.getLogger(__name__)
 
-ALPHABET_SCALE = {"A": 4.0, "B": 3.0, "C": 2.0, "D": 1.0, "E": 0.5, "F": 0.0}
-"""Letter-grade anchor scale embedded in prompts (ALPHABET grading type)."""
-
-
-@dataclass(frozen=True)
-class LlmGradeResult:
-    """Structured result of grading one submission with Gemini.
-
-    Attributes:
-        score: Numeric score (already normalized to NUMBER scale; letters are
-            converted by the prompt contract).
-        summary: One-paragraph assessment summary.
-        feedback: Constructive feedback incl. spelling/grammar notes.
-        plagiarism_score: Plagiarism percentage (0-100), when assessed.
-        plagiarism_analysis: Plagiarism explanation, when assessed.
-    """
-
-    score: float
-    summary: str
-    feedback: str
-    plagiarism_score: float | None
-    plagiarism_analysis: str | None
+_GEMINI_STATE_MAP: dict[str, BatchJobState] = {
+    "JOB_STATE_QUEUED": BatchJobState.PENDING,
+    "JOB_STATE_PENDING": BatchJobState.PENDING,
+    "JOB_STATE_RUNNING": BatchJobState.RUNNING,
+    "JOB_STATE_SUCCEEDED": BatchJobState.SUCCEEDED,
+    "JOB_STATE_FAILED": BatchJobState.FAILED,
+    "JOB_STATE_CANCELLED": BatchJobState.CANCELLED,
+    "JOB_STATE_EXPIRED": BatchJobState.EXPIRED,
+}
+"""Gemini batch state names → normalized :class:`BatchJobState`."""
 
 
 class GeminiLlmGrader:
@@ -51,6 +60,7 @@ class GeminiLlmGrader:
                 should inject ``None`` instead of building the adapter).
         """
         self._model = settings.grading_model
+        self._temperature = settings.grading_temperature
         if not settings.gemini_api_key:
             raise ExternalServiceError("Gemini API key is not configured.")
         from google import genai  # local import: adapter boundary (AGENTS.md §2-D)
@@ -59,7 +69,7 @@ class GeminiLlmGrader:
 
     async def grade_free_text(
         self, *, question_text: str, student_answer: str, max_points: int
-    ) -> LlmGradeResult:
+    ) -> GradingResult:
         """Grade one free-text answer.
 
         Args:
@@ -68,30 +78,27 @@ class GeminiLlmGrader:
             max_points: Maximum points for the question.
 
         Returns:
-            Parsed grading result.
+            Parsed grading result (score clamped to ``max_points``).
 
         Raises:
             ExternalServiceError: When the model call or parsing fails.
         """
-        prompt = (
-            "You are a fair, constructive teacher's assistant.\n"
-            f"Grade the student's answer out of {max_points} points.\n\n"
-            f"Question: {question_text}\n\n"
-            f"Student answer: {student_answer}\n\n"
-            'Return JSON: {"score": number, "summary": str, "feedback": str}.'
+        prompt = build_free_text_prompt(question_text, student_answer, max_points)
+        text = await self._generate_structured(
+            prompt, [], response_schema=free_text_response_schema()
         )
-        raw = await self._generate_json(prompt)
         try:
-            score = min(max(float(raw["score"]), 0.0), float(max_points))
-            return LlmGradeResult(
-                score=score,
-                summary=str(raw.get("summary", "")),
-                feedback=str(raw.get("feedback", "")),
-                plagiarism_score=None,
-                plagiarism_analysis=None,
-            )
-        except (KeyError, TypeError, ValueError) as exc:
-            raise ExternalServiceError("Malformed grading response.") from exc
+            parsed = parse_free_text_text(text)
+        except ExternalServiceError:
+            raise
+        score = min(max(parsed.score, 0.0), float(max_points))
+        return GradingResult(
+            score=score,
+            summary=parsed.summary,
+            feedback=parsed.feedback,
+            plagiarism_score=None,
+            plagiarism_analysis=None,
+        )
 
     async def grade_submission(
         self,
@@ -99,7 +106,7 @@ class GeminiLlmGrader:
         assignment: dict[str, object],
         attachments: list[dict[str, object]],
         ocr_texts: list[str],
-    ) -> LlmGradeResult:
+    ) -> GradingResult:
         """Grade a full offline submission (files + OCR context).
 
         Args:
@@ -121,63 +128,51 @@ class GeminiLlmGrader:
             mime = str(attachment.get("mime_type", "application/octet-stream"))
             if "," in data:
                 data = data.split(",", 1)[1]
-            parts.append(
-                {"inline_data": {"mime_type": mime, "data": base64.b64decode(data)}}
-            )
-        raw = await self._generate_json_structured(
-            prompt, parts, response_schema=GRADING_RESPONSE_SCHEMA
+            parts.append({"inline_data": {"mime_type": mime, "data": base64.b64decode(data)}})
+        text = await self._generate_structured(
+            prompt, parts, response_schema=grading_response_schema()
         )
-        return _parse_grading_result(raw)
+        return parse_grading_text(text)
 
-    async def _generate_json(self, prompt: str) -> dict[str, Any]:
-        """Run a plain JSON-mode generation.
-
-        Args:
-            prompt: Fully built prompt.
-
-        Returns:
-            Parsed JSON mapping.
-        """
-        from google.genai import types
-
-        response = await self._client.aio.models.generate_content(
-            model=self._model,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-            ),
-        )
-        return _loads_json(response.text or "{}")
-
-    async def _generate_json_structured(
+    async def _generate_structured(
         self,
         prompt: str,
         parts: list[dict[str, Any]],
         *,
         response_schema: dict[str, Any],
-    ) -> dict[str, Any]:
-        """Run a schema-constrained multi-part generation.
+    ) -> str:
+        """Run a schema-constrained generation and return the raw text.
 
         Args:
             prompt: Text part carrying the instructions.
-            parts: Additional content parts (inline files).
-            response_schema: Plain-JSON schema for structured output.
+            parts: Additional content parts (inline files); empty for
+                text-only requests.
+            response_schema: JSON schema derived from the Pydantic contract.
 
         Returns:
-            Parsed JSON mapping.
+            Raw response text (parsed by the caller's contract model).
+
+        Raises:
+            ExternalServiceError: When the model call fails.
         """
         from google.genai import types
 
-        contents: list[dict[str, Any]] = [{"parts": parts}]
-        response = await self._client.aio.models.generate_content(
-            model=self._model,
-            contents=contents,
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                response_schema=response_schema,
-            ),
-        )
-        return _loads_json(response.text or "{}")
+        contents: list[dict[str, Any]] = [{"parts": parts or [{"text": prompt}]}]
+        try:
+            response = await self._client.aio.models.generate_content(
+                model=self._model,
+                contents=contents,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_schema=response_schema,
+                    temperature=self._temperature,
+                ),
+            )
+        except ExternalServiceError:
+            raise
+        except Exception as exc:
+            raise ExternalServiceError("Gemini generation failed.") from exc
+        return response.text or ""
 
 
 @runtime_checkable
@@ -190,7 +185,7 @@ class LlmGrader(Protocol):
 
     async def grade_free_text(
         self, *, question_text: str, student_answer: str, max_points: int
-    ) -> LlmGradeResult:
+    ) -> GradingResult:
         """Grade one free-text answer.
 
         Args:
@@ -209,7 +204,7 @@ class LlmGrader(Protocol):
         assignment: dict[str, object],
         attachments: list[dict[str, object]],
         ocr_texts: list[str],
-    ) -> LlmGradeResult:
+    ) -> GradingResult:
         """Grade a full offline submission.
 
         Args:
@@ -223,222 +218,192 @@ class LlmGrader(Protocol):
         ...
 
 
-GRADING_RESPONSE_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "properties": {
-        "score": {"type": "number"},
-        "summary": {"type": "string"},
-        "feedback": {"type": "string"},
-        "plagiarismScore": {"type": "number", "nullable": True},
-        "plagiarismAnalysis": {"type": "string", "nullable": True},
-    },
-    "required": ["score", "summary", "feedback"],
-}
-"""Structured-output schema for full submission grading."""
+def parse_batch_entry(entry: dict[str, Any]) -> BatchGradeOutcome:
+    """Parse one Gemini batch output JSONL line into an outcome.
 
-
-def build_grading_prompt(
-    assignment: dict[str, object], ocr_texts: list[str]
-) -> str:
-    """Build the full-submission grading prompt.
-
-    Mirrors the legacy prompt contract so grading behavior stays consistent.
+    Per-entry failures (error entries, missing candidates, malformed model
+    text, schema violations) become failure outcomes instead of exceptions,
+    so one bad response never fails the whole batch task.
 
     Args:
-        assignment: Context with subject/title/description/gradingPrompt and
-            the check flags/strictness/grading type.
-        ocr_texts: OCR-extracted attachment texts.
+        entry: Parsed ``response`` JSONL line.
 
     Returns:
-        The complete prompt string.
+        Outcome with a validated :class:`GradingResult`, or an ``error``
+        outcome explaining the per-entry failure.
     """
-    grading_type = str(assignment.get("grading_type", "NUMBER"))
-    scale_note = (
-        f"Use the letter scale A={ALPHABET_SCALE['A']} … F={ALPHABET_SCALE['F']} "
-        "and return the letter in 'score'."
-        if grading_type == "ALPHABET"
-        else "Return a numeric score."
-    )
-    checks = [
-        f"penalize_spelling: {bool(assignment.get('check_spelling'))}",
-        f"penalize_grammar: {bool(assignment.get('check_grammar'))}",
-        f"check_plagiarism: {bool(assignment.get('check_plagiarism'))}",
-    ]
-    ocr_block = "\n".join(ocr_texts)
-    return (
-        "You are grading a student submission.\n"
-        f"Subject: {assignment.get('subject')}\n"
-        f"Title: {assignment.get('title')}\n"
-        f"Description: {assignment.get('description')}\n"
-        f"Teacher's grading instructions: {assignment.get('grading_prompt')}\n"
-        f"Strictness: {assignment.get('strictness_level')}\n"
-        f"Configuration: {'; '.join(checks)}\n"
-        f"{scale_note}\n\n"
-        "Assess correctness, completeness, and quality. Provide a summary, "
-        "constructive feedback, and (when plagiarism checking is on) a "
-        "plagiarism score 0-100 with analysis.\n"
-        + (f"\n=== OCR EXTRACTED CONTENT ===\n{ocr_block}\n" if ocr_block else "")
-    )
-
-
-def _parse_grading_result(raw: dict[str, Any]) -> LlmGradeResult:
-    """Normalize the model's JSON into an :class:`LlmGradeResult`.
-
-    Letter scores are converted to their numeric anchors.
-
-    Args:
-        raw: Parsed model output.
-
-    Returns:
-        Typed grading result.
-
-    Raises:
-        ExternalServiceError: When required fields are missing/invalid.
-    """
+    key = str(entry.get("key", ""))
+    error = entry.get("error")
+    if error:
+        return BatchGradeOutcome.failed(key, f"provider error: {error}")
+    candidates = (entry.get("response") or {}).get("candidates") or []
+    if not candidates:
+        return BatchGradeOutcome.failed(key, "response has no candidates")
+    parts = (candidates[0].get("content") or {}).get("parts") or []
+    texts = [str(p.get("text", "")) for p in parts if isinstance(p, dict)]
+    text = "".join(texts).strip()
+    if not text:
+        return BatchGradeOutcome.failed(key, "response has no text")
     try:
-        raw_score = raw["score"]
-        score: float
-        if isinstance(raw_score, str) and raw_score.strip().upper() in ALPHABET_SCALE:
-            score = ALPHABET_SCALE[raw_score.strip().upper()]
-        else:
-            score = float(raw_score)
-        plagiarism = raw.get("plagiarismScore")
-        return LlmGradeResult(
-            score=score,
-            summary=str(raw.get("summary", "")),
-            feedback=str(raw.get("feedback", "")),
-            plagiarism_score=float(plagiarism) if plagiarism is not None else None,
-            plagiarism_analysis=(
-                str(raw["plagiarismAnalysis"])
-                if raw.get("plagiarismAnalysis") is not None
-                else None
-            ),
-        )
-    except (KeyError, TypeError, ValueError) as exc:
-        raise ExternalServiceError("Malformed grading response.") from exc
-
-
-def _loads_json(text: str) -> dict[str, Any]:
-    """Parse model output tolerating markdown fences.
-
-    Args:
-        text: Raw model text.
-
-    Returns:
-        Parsed mapping.
-
-    Raises:
-        ExternalServiceError: When parsing fails.
-    """
-    cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", text.strip(), flags=re.MULTILINE)
-    try:
-        parsed: Any = json.loads(cleaned)
-    except json.JSONDecodeError as exc:
-        raise ExternalServiceError("Malformed model output.") from exc
-    if not isinstance(parsed, dict):
-        raise ExternalServiceError("Malformed model output.")
-    return parsed
+        return BatchGradeOutcome(key=key, result=parse_grading_text(text))
+    except ExternalServiceError as exc:
+        return BatchGradeOutcome.failed(key, str(exc))
 
 
 class BatchGeminiClient:
-    """Gemini Batch API operations for the background grading worker."""
+    """Gemini Batch API adapter implementing :class:`BatchGradingClient`."""
 
     def __init__(self, settings: Settings) -> None:
         """Create the client.
 
         Args:
-            settings: Settings providing the API key and model name.
+            settings: Settings providing the API key, model name, and
+                sampling knobs.
 
         Raises:
             ExternalServiceError: When no API key is configured.
         """
         self._model = settings.grading_model
+        self._temperature = settings.grading_temperature
         if not settings.gemini_api_key:
             raise ExternalServiceError("Gemini API key is not configured.")
         from google import genai
 
         self._client: Any = genai.Client(api_key=settings.gemini_api_key)
 
-    async def upload_jsonl(self, path: Path) -> str:
-        """Upload a JSONL batch input file.
+    async def create_job(self, requests: Sequence[BatchGradeRequest]) -> BatchJobHandle:
+        """Upload a JSONL payload and create the Gemini batch job.
+
+        Each line carries the provider's ``generationConfig`` with the
+        shared Pydantic schema and the configured sampling temperature, so
+        batch responses come back schema-constrained and deterministic.
 
         Args:
-            path: Local JSONL file.
+            requests: One entry per submission to grade.
 
         Returns:
-            Gemini file name for batch creation.
+            Handle with the batch job name and uploaded input file name.
 
         Raises:
-            ExternalServiceError: On upload failure.
+            ExternalServiceError: On upload/creation failure.
         """
+        from app.services.ai.ocr import temporary_jsonl_path
+
+        lines: list[str] = []
+        for request in requests:
+            parts: list[dict[str, Any]] = [{"text": request.prompt}]
+            for blob in request.files:
+                parts.append(
+                    {
+                        "inline_data": {
+                            "mime_type": blob.mime_type,
+                            "data": base64.b64encode(blob.data).decode(),
+                        }
+                    }
+                )
+            payload = {
+                "key": request.key,
+                "request": {
+                    "contents": [{"parts": parts}],
+                    "generationConfig": {
+                        "responseMimeType": "application/json",
+                        "responseSchema": grading_response_schema(),
+                        "temperature": self._temperature,
+                    },
+                },
+            }
+            lines.append(json.dumps(payload))
+
+        path = temporary_jsonl_path("batch-input")
+        path.write_text("\n".join(lines), encoding="utf-8")
         try:
             file = await self._client.aio.files.upload(file=path)
-            return str(file.name)
+            batch = await self._client.aio.batches.create(model=self._model, src=str(file.name))
         except Exception as exc:
-            raise ExternalServiceError("Failed to upload batch input.") from exc
+            raise ExternalServiceError("Failed to create Gemini batch job.") from exc
+        return BatchJobHandle(job_name=str(batch.name), input_ref=str(file.name))
 
-    async def create_batch(self, input_file_name: str) -> str:
-        """Create a batch job over an uploaded JSONL file.
+    async def poll(self, job_name: str) -> BatchJobSnapshot:
+        """Poll a batch job and normalize its state.
 
         Args:
-            input_file_name: File name returned by :meth:`upload_jsonl`.
+            job_name: Name returned by :meth:`create_job`.
 
         Returns:
-            Batch job name.
-
-        Raises:
-            ExternalServiceError: On creation failure.
-        """
-        try:
-            batch = await self._client.aio.batches.create(
-                model=self._model, src=input_file_name
-            )
-            return str(batch.name)
-        except Exception as exc:
-            raise ExternalServiceError("Failed to create batch job.") from exc
-
-    async def get_batch_state(self, job_name: str) -> tuple[str, str | None]:
-        """Poll a batch job's state.
-
-        Args:
-            job_name: Batch job name.
-
-        Returns:
-            Tuple of (job state, output file name when succeeded).
+            Snapshot with the normalized state and output file reference
+            when succeeded.
 
         Raises:
             ExternalServiceError: On polling failure.
         """
         try:
             batch = await self._client.aio.batches.get(name=job_name)
-            output = getattr(batch, "output_file_name", None) or getattr(
-                getattr(batch, "dest", None), "output_file_name", None
-            )
-            return str(batch.state.name if hasattr(batch.state, "name") else batch.state), (
-                str(output) if output else None
-            )
         except Exception as exc:
             raise ExternalServiceError("Failed to poll batch job.") from exc
+        state = _normalize_state(batch)
+        output = getattr(batch, "output_file_name", None) or getattr(
+            getattr(batch, "dest", None), "output_file_name", None
+        )
+        return BatchJobSnapshot(
+            state=state,
+            output_ref=str(output) if output else None,
+        )
 
-    async def download_output(self, file_name: str) -> bytes:
-        """Download a batch output file's bytes.
+    async def collect(self, job_name: str, snapshot: BatchJobSnapshot) -> list[BatchGradeOutcome]:
+        """Download the output JSONL and parse it into per-key outcomes.
 
         Args:
-            file_name: Output file name from :meth:`get_batch_state`.
+            job_name: Name returned by :meth:`create_job`.
+            snapshot: The succeeded snapshot carrying ``output_ref``.
 
         Returns:
-            File content (JSONL).
+            One outcome per output line (failures carried as ``error``).
+
+        Raises:
+            ExternalServiceError: When the output cannot be downloaded.
         """
+        if not snapshot.output_ref:
+            raise ExternalServiceError("Succeeded batch has no output file.")
         try:
-            file = await self._client.aio.files.download(file=file_name)
+            file = await self._client.aio.files.download(file=snapshot.output_ref)
             import asyncio
 
-            return await asyncio.to_thread(Path(str(file)).read_bytes)
+            content = await asyncio.to_thread(Path(str(file)).read_bytes)
+        except ExternalServiceError:
+            raise
         except Exception as exc:
             raise ExternalServiceError("Failed to download batch output.") from exc
+        outcomes: list[BatchGradeOutcome] = []
+        for line in content.decode("utf-8").splitlines():
+            if not line.strip():
+                continue
+            try:
+                entry: dict[str, Any] = json.loads(line)
+            except json.JSONDecodeError:
+                outcomes.append(BatchGradeOutcome.failed("", "unparseable output line"))
+                continue
+            outcomes.append(parse_batch_entry(entry))
+        return outcomes
 
-    async def delete_file(self, file_name: str) -> None:
-        """Best-effort deletion of an uploaded Gemini file.
+    async def dispose(
+        self, job_name: str, input_ref: str | None, snapshot: BatchJobSnapshot
+    ) -> None:
+        """Best-effort deletion of the input/output Gemini files.
+
+        Args:
+            job_name: Name returned by :meth:`create_job` (unused by this
+                provider; kept for port symmetry).
+            input_ref: Uploaded input file name, when known.
+            snapshot: Terminal snapshot carrying the output file name.
+        """
+        _ = job_name
+        if input_ref:
+            await self._delete_file(input_ref)
+        if snapshot.output_ref:
+            await self._delete_file(snapshot.output_ref)
+
+    async def _delete_file(self, file_name: str) -> None:
+        """Delete one Gemini file, logging (not raising) on failure.
 
         Args:
             file_name: File name to delete.
@@ -447,3 +412,18 @@ class BatchGeminiClient:
             await self._client.aio.files.delete(name=file_name)
         except Exception:
             logger.debug("Failed to delete Gemini file %s", file_name, exc_info=True)
+
+
+def _normalize_state(batch: object) -> BatchJobState:
+    """Map a Gemini batch object's state onto :class:`BatchJobState`.
+
+    Args:
+        batch: Batch object from the SDK (``batch.state.name`` when named).
+
+    Returns:
+        The normalized state; unknown states map to ``PENDING`` (never
+        accidentally terminal).
+    """
+    state = getattr(batch, "state", None)
+    name = getattr(state, "name", None) or str(state or "")
+    return _GEMINI_STATE_MAP.get(name, BatchJobState.PENDING)

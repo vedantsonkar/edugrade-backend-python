@@ -6,9 +6,12 @@ sanitization, the assessment attempt workflow, submissions, and files.
 """
 
 
+from uuid import UUID
+
 import pytest
 from app.core.db.engine import session_scope
 from app.domain.enums import UserRole
+from app.domain.schools import School
 from fastapi.testclient import TestClient
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -64,7 +67,7 @@ class TestAuthFlow:
         """The full auth lifecycle works and rotates tokens."""
         body = _login(client, "student@test.edu", "Student@123")
         assert body["user"]["role"] == "STUDENT"
-        assert body["school"]["subdomain"] == "test-academy"
+        assert body["school"]["schoolKey"] == "test-academy"
         assert body["enableLogging"] is True
 
         me = client.get("/api/v1/auth/me")
@@ -154,9 +157,63 @@ class TestAuthFlow:
         self, client: TestClient, seeded_ids: dict[str, str]
     ) -> None:
         """/school/config/public resolves branding without auth."""
-        response = client.get("/api/v1/school/config/public?subdomain=test-academy")
+        response = client.get("/api/v1/school/config/public?schoolKey=test-academy")
         assert response.status_code == 200
         assert response.json()["name"] == "Test Academy"
+        assert response.json()["schoolKey"] == "test-academy"
+
+    def test_public_school_branding_unknown_key_404(
+        self, client: TestClient
+    ) -> None:
+        """Unknown and case variants of unknown keys return the 404 envelope."""
+        response = client.get("/api/v1/school/config/public?schoolKey=nope")
+        assert response.status_code == 404
+        assert response.json()["error"]["code"] == "NOT_FOUND"
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [("is_active", False), ("deleted_at", "set")],
+        ids=["disabled", "soft-deleted"],
+    )
+    async def test_unavailable_school_branding_404(
+        self,
+        client: TestClient,
+        seeded_ids: dict[str, str],
+        db_sessionmaker: async_sessionmaker[AsyncSession],
+        field: str,
+        value: object,
+    ) -> None:
+        """Disabled and soft-deleted schools are indistinguishable from unknown."""
+        from datetime import UTC, datetime
+
+        async with session_scope(db_sessionmaker) as session:
+            school = await session.get(School, UUID(seeded_ids["school"]))
+            assert school is not None
+            if field == "is_active":
+                school.is_active = False
+            else:
+                school.deleted_at = datetime.now(UTC)
+        response = client.get("/api/v1/school/config/public?schoolKey=test-academy")
+        assert response.status_code == 404
+        assert response.json()["error"]["code"] == "NOT_FOUND"
+
+    async def test_disabled_school_login_403(
+        self,
+        client: TestClient,
+        seeded_ids: dict[str, str],
+        db_sessionmaker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """Login into a disabled school is rejected even with valid credentials."""
+        async with session_scope(db_sessionmaker) as session:
+            school = await session.get(School, UUID(seeded_ids["school"]))
+            assert school is not None
+            school.is_active = False
+        response = client.post(
+            "/api/v1/auth/login",
+            json={"email": "student@test.edu", "password": "Student@123"},
+        )
+        assert response.status_code == 403
+        assert response.json()["error"]["code"] == "FORBIDDEN"
 
     def test_validate_admin_key(
         self, client: TestClient, seeded_ids: dict[str, str]
@@ -164,12 +221,12 @@ class TestAuthFlow:
         """Admin-key validation succeeds and fails correctly."""
         ok = client.post(
             "/api/v1/school/validate-admin",
-            json={"adminKey": "test-admin-key", "subdomain": "test-academy"},
+            json={"adminKey": "test-admin-key", "schoolKey": "test-academy"},
         )
         assert ok.status_code == 200 and ok.json()["valid"] is True
         bad = client.post(
             "/api/v1/school/validate-admin",
-            json={"adminKey": "wrong", "subdomain": "test-academy"},
+            json={"adminKey": "wrong", "schoolKey": "test-academy"},
         )
         assert bad.status_code == 200 and bad.json()["valid"] is False
 

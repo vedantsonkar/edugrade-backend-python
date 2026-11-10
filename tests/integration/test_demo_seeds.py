@@ -27,7 +27,7 @@ async def demo_tenants(
     """Seed the production demo templates inside the isolated test database."""
     async with session_scope(db_sessionmaker) as session:
         created = await seed_demo_schools(session, hasher, now=cast(datetime, clock.now()))
-        assert created == [definition.subdomain for definition in DEMO_SCHOOLS]
+        assert created == [definition.school_key for definition in DEMO_SCHOOLS]
         schools = (await session.scalars(select(School))).all()
         tenants: dict[str, dict[str, str]] = {}
         for school in schools:
@@ -38,7 +38,7 @@ async def demo_tenants(
             assignment = (
                 await session.scalars(select(Assignment).where(Assignment.school_id == school.id))
             ).one()
-            tenants[school.subdomain] = {
+            tenants[school.school_key] = {
                 "school": str(school.id),
                 "class": str(classroom.id),
                 "assignment": str(assignment.id),
@@ -76,11 +76,11 @@ async def test_seed_rerun_preserves_users_and_does_not_duplicate_data(
             classroom = (
                 await session.scalars(
                     select(Classroom).where(
-                        Classroom.school_id == demo_tenants[definition.subdomain]["school"]
+                        Classroom.school_id == demo_tenants[definition.school_key]["school"]
                     )
                 )
             ).one()
-            assert str(classroom.class_teacher_id) == demo_tenants[definition.subdomain]["teacher"]
+            assert str(classroom.class_teacher_id) == demo_tenants[definition.school_key]["teacher"]
 
 
 async def test_seed_adds_second_school_when_first_already_exists(
@@ -90,7 +90,7 @@ async def test_seed_adds_second_school_when_first_already_exists(
 ) -> None:
     """An existing first tenant must not cause the entire seed command to exit."""
     async with session_scope(db_sessionmaker) as session:
-        school = School(name="Existing Academy", subdomain="demo-school", admin_key="changed-key")
+        school = School(name="Existing Academy", school_key="demo-school", admin_key="changed-key")
         session.add(school)
         await session.flush()
         school_id = str(school.id)
@@ -109,7 +109,7 @@ async def test_seed_adds_second_school_when_first_already_exists(
         assert created == ["demo-school-2"]
         schools = (await session.scalars(select(School))).all()
         assert len(schools) == 2
-        original = next(school for school in schools if school.subdomain == "demo-school")
+        original = next(school for school in schools if school.school_key == "demo-school")
         assert str(original.id) == school_id
         assert original.name == "Existing Academy"
         assert original.admin_key == "changed-key"
@@ -129,12 +129,12 @@ def test_demo_logins_and_assignment_reads_are_tenant_scoped(
 ) -> None:
     """Every seeded login sees its own quiz and cannot access a foreign quiz."""
     for definition in DEMO_SCHOOLS:
-        own = demo_tenants[definition.subdomain]
+        own = demo_tenants[definition.school_key]
         foreign = next(
-            tenant for name, tenant in demo_tenants.items() if name != definition.subdomain
+            tenant for name, tenant in demo_tenants.items() if name != definition.school_key
         )
         credentials = {
-            "email": f"{account.email_prefix}@{definition.subdomain}.edu",
+            "email": f"{account.email_prefix}@{definition.school_key}.edu",
             "password": account.password,
             "loginType": "student" if account.role == UserRole.STUDENT else "admin",
             "schoolId": own["school"],
@@ -171,10 +171,10 @@ def test_demo_admin_keys_are_scoped_to_selected_school(
     """A valid key for one school does not unlock the other school's staff tab."""
     for definition in DEMO_SCHOOLS:
         foreign = next(
-            tenant for name, tenant in demo_tenants.items() if name != definition.subdomain
+            tenant for name, tenant in demo_tenants.items() if name != definition.school_key
         )
         for school_id, expected in (
-            (demo_tenants[definition.subdomain]["school"], True),
+            (demo_tenants[definition.school_key]["school"], True),
             (foreign["school"], False),
         ):
             response = client.post(
@@ -191,7 +191,7 @@ def test_demo_teacher_cannot_target_foreign_classroom(
     """Cross-school classroom IDs cannot be used in assignment creation or filters."""
     own = demo_tenants["demo-school"]
     foreign = demo_tenants["demo-school-2"]
-    definition = next(d for d in DEMO_SCHOOLS if d.subdomain == "demo-school")
+    definition = next(d for d in DEMO_SCHOOLS if d.school_key == "demo-school")
     response = client.post(
         "/api/v1/auth/login",
         json={

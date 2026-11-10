@@ -27,6 +27,21 @@ class UserRepository(BaseRepository[User]):
         stmt = select(User).where(func.lower(User.email) == email.lower())
         return (await self.session.execute(stmt)).scalar_one_or_none()
 
+    async def get_by_ids(self, ids: list[UUID]) -> list[User]:
+        """Fetch users by primary key (bulk, for display-name resolution).
+
+        Args:
+            ids: Primary keys to load; missing ids are silently omitted.
+
+        Returns:
+            The found users.
+        """
+        if not ids:
+            return []
+        stmt = select(User).where(User.id.in_(ids))
+        rows = (await self.session.execute(stmt)).scalars().all()
+        return list(rows)
+
     async def scoped(self, school_id: str, role: UserRole | None = None) -> Select[User]:
         """Build a school-scoped user select, optionally by role.
 

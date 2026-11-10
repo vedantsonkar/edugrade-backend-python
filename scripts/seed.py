@@ -38,7 +38,7 @@ class DemoSchoolSeed:
     """Public development tenant identity and its sample assignment title."""
 
     name: str
-    subdomain: str
+    school_key: str
     admin_key: str
     primary_color: str
     assignment_title: str
@@ -58,14 +58,14 @@ class DemoUserSeed:
 DEMO_SCHOOLS = (
     DemoSchoolSeed(
         name="Demo Academy",
-        subdomain="demo-school",
+        school_key="demo-school",
         admin_key="demo-admin-key",
         primary_color="#3b82f6",
         assignment_title="Photosynthesis Basics",
     ),
     DemoSchoolSeed(
         name="Demo Academy 2",
-        subdomain="demo-school-2",
+        school_key="demo-school-2",
         admin_key="demo-admin-key-2",
         primary_color="#059669",
         assignment_title="Photosynthesis Basics (School 2)",
@@ -104,13 +104,13 @@ async def seed() -> None:
             created = await seed_demo_schools(session, hasher, now=datetime.now(UTC))
             await session.commit()
         for definition in DEMO_SCHOOLS:
-            status = "Created" if definition.subdomain in created else "Already present; unchanged"
-            print(f"{status}: {definition.name} (subdomain={definition.subdomain})")
+            status = "Created" if definition.school_key in created else "Already present; unchanged"
+            print(f"{status}: {definition.name} (school key={definition.school_key})")
             print(f"  admin key   : {definition.admin_key} (seed default)")
             for account in DEMO_USERS:
                 print(
                     f"  {account.email_prefix:12}: "
-                    f"{account.email_prefix}@{definition.subdomain}.edu / {account.password}"
+                    f"{account.email_prefix}@{definition.school_key}.edu / {account.password}"
                     " (seed default)"
                 )
     finally:
@@ -128,17 +128,19 @@ async def seed_demo_schools(
         now: Timezone-aware reference time for the quizzes' open window.
 
     Returns:
-        Subdomains created in this transaction.
+        School keys created in this transaction.
     """
     created: list[str] = []
     for definition in DEMO_SCHOOLS:
         existing = (
-            await session.execute(select(School).where(School.subdomain == definition.subdomain))
+            await session.execute(
+                select(School).where(School.school_key == definition.school_key)
+            )
         ).scalar_one_or_none()
         if existing is not None:
             continue
         await _create_demo_school(session, definition, hasher, now)
-        created.append(definition.subdomain)
+        created.append(definition.school_key)
     return created
 
 
@@ -148,7 +150,7 @@ async def _create_demo_school(
     """Build a tenant using only taxonomy and users from that tenant."""
     school = School(
         name=definition.name,
-        subdomain=definition.subdomain,
+        school_key=definition.school_key,
         admin_key=definition.admin_key,
         primary_color=definition.primary_color,
     )
@@ -177,7 +179,7 @@ async def _create_demo_school(
     for account in DEMO_USERS:
         student = account.role == UserRole.STUDENT
         user = User(
-            email=f"{account.email_prefix}@{definition.subdomain}.edu",
+            email=f"{account.email_prefix}@{definition.school_key}.edu",
             name=account.name,
             role=account.role,
             school_id=str(school.id),

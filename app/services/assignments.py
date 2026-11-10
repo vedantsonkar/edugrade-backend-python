@@ -393,6 +393,24 @@ class AssignmentService:
         )
         return refreshed or assignment
 
+    async def delete_assignment(self, principal: UserPrincipal, assignment_id: UUID) -> None:
+        """Delete an assignment; only the creator or an admin may do so.
+
+        Questions, submissions, attempts, targets, and related rows are
+        removed with it (ORM ``cascade="all, delete-orphan"`` backed by
+        ``ondelete="CASCADE"`` foreign keys).
+
+        Args:
+            principal: Authenticated staff caller.
+            assignment_id: Assignment id.
+
+        Raises:
+            NotFoundError: When absent in the caller's school.
+            ForbiddenError: When a non-creator teacher attempts the delete.
+        """
+        assignment = await self._require_manageable(principal, assignment_id)
+        await self._assignments.delete(assignment)
+
     # ── Questions ────────────────────────────────────────────────────────
 
     async def list_questions(self, principal: UserPrincipal, assignment_id: UUID) -> list[Question]:

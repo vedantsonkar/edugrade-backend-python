@@ -4,9 +4,10 @@ A school is the tenancy boundary: every other entity is scoped (directly or
 transitively) by a school id, and all repositories filter on it.
 """
 
+from datetime import datetime
 from typing import TYPE_CHECKING
 
-from sqlalchemy import Boolean, ForeignKey, String, UniqueConstraint
+from sqlalchemy import Boolean, DateTime, ForeignKey, String, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.db.base import UUID_KEY, Base, TimestampMixin, UUID7PKMixin
@@ -23,10 +24,14 @@ class School(UUID7PKMixin, TimestampMixin, Base):
 
     Attributes:
         name: Display name.
-        subdomain: URL identifier, unique across the platform.
+        school_key: Public identifier users type on the login page, unique
+            across the platform.
         primary_color: Brand hex color (``#rrggbb``).
         logo_url: Storage key of the school logo, if any.
         admin_key: Onboarding secret used by ``POST /school/validate-admin``.
+        is_active: Whether the school is enabled; disabled schools are
+            invisible to lookups and reject logins.
+        deleted_at: Soft-delete timestamp; ``None`` while the school exists.
         phone_country_code / phone_number / address / city / state / country /
             postal_code: Contact and location details.
         default_locale: BCP-47 default locale for communications.
@@ -36,10 +41,14 @@ class School(UUID7PKMixin, TimestampMixin, Base):
     __tablename__ = "schools"
 
     name: Mapped[str] = mapped_column(String(255))
-    subdomain: Mapped[str] = mapped_column(String(63), unique=True, index=True)
+    school_key: Mapped[str] = mapped_column(String(63), unique=True, index=True)
     primary_color: Mapped[str] = mapped_column(String(9), default="#3b82f6")
     logo_url: Mapped[str | None] = mapped_column(String(512))
     admin_key: Mapped[str] = mapped_column(String(255), unique=True)
+    is_active: Mapped[bool] = mapped_column(
+        Boolean, default=True, server_default="true", index=True
+    )
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     phone_country_code: Mapped[str] = mapped_column(String(8), default="+91")
     phone_number: Mapped[str | None] = mapped_column(String(15))
     address: Mapped[str | None] = mapped_column(String(512))
@@ -56,6 +65,11 @@ class School(UUID7PKMixin, TimestampMixin, Base):
     users: Mapped[list[User]] = relationship(back_populates="school")
     classrooms: Mapped[list[Classroom]] = relationship(back_populates="school")
     batch_tasks: Mapped[list[BatchGradingTask]] = relationship(back_populates="school")
+
+    @property
+    def is_available(self) -> bool:
+        """Whether the school is usable: not disabled and not soft-deleted."""
+        return self.is_active and self.deleted_at is None
 
 
 class SchoolConfig(UUID7PKMixin, TimestampMixin, Base):

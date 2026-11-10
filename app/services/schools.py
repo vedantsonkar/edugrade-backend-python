@@ -31,20 +31,22 @@ class SchoolService:
         self._configs = configs
         self._storage = storage
 
-    async def get_public_branding(self, subdomain: str) -> School:
+    async def get_public_branding(self, school_key: str) -> School:
         """Resolve a school for the unauthenticated login page.
 
         Args:
-            subdomain: School subdomain.
+            school_key: Public school key.
 
         Returns:
             The school.
 
         Raises:
-            NotFoundError: When no school uses the subdomain.
+            NotFoundError: When no available (active, not deleted) school
+                uses the key - disabled schools are indistinguishable from
+                unknown ones.
         """
-        school = await self._schools.get_by_subdomain(subdomain)
-        if school is None:
+        school = await self._schools.get_by_school_key(school_key)
+        if school is None or not school.is_available:
             raise NotFoundError("School not found.")
         return school
 
@@ -60,24 +62,24 @@ class SchoolService:
         *,
         admin_key: str,
         school_id: str | None,
-        subdomain: str | None,
+        school_key: str | None,
     ) -> tuple[bool, School | None]:
         """Validate a school onboarding key (constant-time comparison).
 
-        Exactly one of ``school_id``/``subdomain`` identifies the tenant;
+        Exactly one of ``school_id``/``school_key`` identifies the tenant;
         when neither is given the key alone is matched platform-wide.
 
         Args:
             admin_key: Presented key.
             school_id: Optional school id.
-            subdomain: Optional subdomain.
+            school_key: Optional school key.
 
         Returns:
             Tuple of (valid?, matched school or ``None``).
         """
         school: School | None = None
-        if subdomain:
-            school = await self._schools.get_by_subdomain(subdomain)
+        if school_key:
+            school = await self._schools.get_by_school_key(school_key)
         elif school_id:
             school = await self._schools.get(UUID(school_id))
         if school is not None:
@@ -135,14 +137,14 @@ class SchoolService:
             The updated school.
 
         Raises:
-            ConflictError: When the new subdomain is already taken.
+            ConflictError: When the new school key is already taken.
         """
         school = await self.get_settings(school_id)
 
         data = updates.model_dump(exclude_unset=True, by_alias=False)
         school_fields = {
             "name",
-            "subdomain",
+            "school_key",
             "primary_color",
             "logo_url",
             "phone_country_code",
@@ -162,13 +164,13 @@ class SchoolService:
             "current_academic_year",
         }
 
-        if "subdomain" in data and data["subdomain"] is not None:
-            new_subdomain = str(data["subdomain"]).lower()
-            if new_subdomain != school.subdomain:
-                existing = await self._schools.get_by_subdomain(new_subdomain)
+        if "school_key" in data and data["school_key"] is not None:
+            new_school_key = str(data["school_key"]).lower()
+            if new_school_key != school.school_key:
+                existing = await self._schools.get_by_school_key(new_school_key)
                 if existing is not None:
-                    raise ConflictError("Subdomain is already in use.")
-                school.subdomain = new_subdomain
+                    raise ConflictError("School key is already in use.")
+                school.school_key = new_school_key
 
         logo = data.get("logo_url")
         if (
@@ -203,11 +205,11 @@ class SchoolService:
 
         Raises:
             ForbiddenError: When the principal carries no school.
-            NotFoundError: When the school vanished.
+            NotFoundError: When the school vanished or is unavailable.
         """
         if principal.school_id is None:
             raise ForbiddenError("Caller has no school context.")
         school = await self._schools.get(UUID(principal.school_id))
-        if school is None:
+        if school is None or not school.is_available:
             raise NotFoundError("School not found.")
         return school

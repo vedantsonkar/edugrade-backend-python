@@ -2,6 +2,7 @@
 
 import csv
 import io
+import re
 import secrets
 from dataclasses import dataclass
 from datetime import datetime
@@ -286,6 +287,11 @@ class AdminService:
             raise NotFoundError("Grade not found.")
         if division is None or str(division.school_id) != school_id:
             raise NotFoundError("Division not found.")
+        class_teacher = None
+        if payload.class_teacher_id:
+            class_teacher = await self._users.get(UUID(payload.class_teacher_id))
+            if class_teacher is None or str(class_teacher.school_id) != school_id:
+                raise NotFoundError("Teacher not found.")
         if await self._classrooms.pair_exists(school_id, payload.grade_id, payload.division_id):
             raise ConflictError("A classroom for this grade and division exists.")
 
@@ -294,7 +300,7 @@ class AdminService:
             config = await self._configs.get_for_school(school_id)
             academic_year = config.current_academic_year if config else "2025-2026"
 
-        return await self._classrooms.add(
+        classroom = await self._classrooms.add(
             Classroom(
                 school_id=school_id,
                 grade_id=payload.grade_id,
@@ -303,6 +309,14 @@ class AdminService:
                 academic_year=academic_year,
             )
         )
+        # Attach the already-fetched relations so response validation reads
+        # loaded attributes instead of lazy-loading outside the session
+        # (which raises MissingGreenlet in async context).
+        classroom.grade = grade
+        classroom.division = division
+        if class_teacher is not None:
+            classroom.class_teacher = class_teacher
+        return classroom
 
     async def update_classroom(
         self, school_id: str, classroom_id: UUID, payload: ClassroomUpdate
@@ -515,7 +529,7 @@ class AdminService:
         """
         await self._ensure_email_free(payload.email)
         password = payload.password or (
-            "".join(payload.name.split()) + payload.date_of_birth.strftime("%Y%m%d")
+            self._generated_password(payload.name, payload.date_of_birth)
             if payload.date_of_birth
             else secrets.token_urlsafe(12)
         )
@@ -689,7 +703,7 @@ class AdminService:
                 user = change.existing
                 if user is None:
                     password = change.password or (
-                        "".join(change.name.split()) + change.date_of_birth.strftime("%Y%m%d")
+                        self._generated_password(change.name, change.date_of_birth)
                         if change.date_of_birth
                         else secrets.token_urlsafe(16)
                     )
@@ -844,6 +858,26 @@ class AdminService:
         if user is None or str(user.school_id) != school_id or user.role != role:
             raise NotFoundError("User not found.")
         return user
+
+    @staticmethod
+    def _generated_password(name: str, date_of_birth: datetime) -> str:
+        """Build the auto-generated initial password ``Name + YYYYMMDD``.
+
+        The name is reduced to ASCII letters and digits so the password
+        survives CSV round-trips, shell logins, and form validation —
+        apostrophes and hyphens in names must not leak into credentials.
+
+        Args:
+            name: Account holder's full name.
+            date_of_birth: DOB whose digits suffix the password.
+
+        Returns:
+            The generated password (random token when the name yields nothing).
+        """
+        stem = re.sub(r"[^A-Za-z0-9]", "", name)
+        if not stem:
+            return secrets.token_urlsafe(12)
+        return stem + date_of_birth.strftime("%Y%m%d")
 
     async def _resolve_password_hash(
         self, password: str | None, date_of_birth: datetime | None

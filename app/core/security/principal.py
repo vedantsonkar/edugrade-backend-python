@@ -23,7 +23,7 @@ class UserPrincipal:
         school_id: School the caller belongs to; ``None`` only for anonymous
             callers produced by the optional dependency.
         school_name: Denormalized school name for branding.
-        school_subdomain: Denormalized school subdomain.
+        school_key: Denormalized public school key.
         enable_logging: Whether client-side analytics logging is enabled for
             the caller's school.
     """
@@ -34,7 +34,7 @@ class UserPrincipal:
     role: str
     school_id: str | None = None
     school_name: str | None = None
-    school_subdomain: str | None = None
+    school_key: str | None = None
     enable_logging: bool = False
 
     @classmethod
@@ -59,9 +59,7 @@ class UserPrincipal:
             role=str(claims["role"]),
             school_id=str(claims["schoolId"]) if "schoolId" in claims else None,
             school_name=(str(claims["schoolName"]) if "schoolName" in claims else None),
-            school_subdomain=(
-                str(claims["schoolSubdomain"]) if "schoolSubdomain" in claims else None
-            ),
+            school_key=str(claims["schoolKey"]) if "schoolKey" in claims else None,
             enable_logging=bool(claims.get("enableLogging", False)),
         )
 
@@ -80,6 +78,6 @@ class UserPrincipal:
         if self.school_id is not None:
             claims["schoolId"] = self.school_id
             claims["schoolName"] = self.school_name
-            claims["schoolSubdomain"] = self.school_subdomain
+            claims["schoolKey"] = self.school_key
             claims["enableLogging"] = self.enable_logging
         return claims

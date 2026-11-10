@@ -63,7 +63,7 @@ async def foreign_school(
 
     async with session_scope(db_sessionmaker) as session:
         school = School(
-            name="Other Academy", subdomain="other-academy", admin_key="other-admin-key"
+            name="Other Academy", school_key="other-academy", admin_key="other-admin-key"
         )
         session.add(school)
         await session.flush()
@@ -305,5 +305,23 @@ class TestMidSessionRevocation:
             user = await session.get(User, UUID(seeded_ids["student"]))
             assert user is not None
             user.is_active = False
+        response = client.get("/api/v1/auth/me", headers=headers)
+        assert response.status_code == 401
+
+    async def test_disabled_school_session_killed_on_me(
+        self,
+        client: TestClient,
+        seeded_ids: dict[str, str],
+        db_sessionmaker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """/auth/me refuses live sessions whose school gets disabled."""
+        from app.domain.schools import School as SchoolEntity
+
+        headers = _bearer(client, "student@test.edu", "Student@123")
+        assert client.get("/api/v1/auth/me", headers=headers).status_code == 200
+        async with session_scope(db_sessionmaker) as session:
+            school = await session.get(SchoolEntity, UUID(seeded_ids["school"]))
+            assert school is not None
+            school.is_active = False
         response = client.get("/api/v1/auth/me", headers=headers)
         assert response.status_code == 401

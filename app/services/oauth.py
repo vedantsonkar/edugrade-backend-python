@@ -1,6 +1,6 @@
 """Server-side Google OAuth login flow.
 
-Builds the consent redirect (state carries the school subdomain, signed and
+Builds the consent redirect (state carries the school key, signed and
 short-lived), exchanges the callback code for an id token, upserts the user,
 and issues application tokens. SSO rules: the account must be active, permit
 Google login, and staff accounts must use the credentials portal.
@@ -85,12 +85,12 @@ class GoogleOAuthService:
         self._ids = id_provider
         self._http = http_client
 
-    def authorization_url(self, subdomain: str | None) -> str:
+    def authorization_url(self, school_key: str | None) -> str:
         """Build the Google consent URL.
 
         Args:
-            subdomain: School subdomain the login page belongs to; embedded
-                in the signed state so the callback can resolve tenancy.
+            school_key: School key the login page belongs to; embedded in the
+                signed state so the callback can resolve tenancy.
 
         Returns:
             Full consent URL to redirect the browser to.
@@ -100,7 +100,7 @@ class GoogleOAuthService:
         """
         if not self._settings.google_client_id or not self._settings.google_client_secret:
             raise ExternalServiceError("Google login is not configured.")
-        state = self._make_state(subdomain)
+        state = self._make_state(school_key)
         params: dict[str, str] = {
             "client_id": self._settings.google_client_id,
             "redirect_uri": self._settings.google_oauth_redirect_uri,
@@ -187,7 +187,7 @@ class GoogleOAuthService:
             role=user.role.value,
             school_id=str(school.id),
             school_name=school.name,
-            school_subdomain=school.subdomain,
+            school_key=school.school_key,
             enable_logging=enable_logging,
         )
         access = self._tokens.create_access_token(principal)
@@ -203,18 +203,18 @@ class GoogleOAuthService:
             access_token=access,
         )
 
-    def _make_state(self, subdomain: str | None) -> str:
+    def _make_state(self, school_key: str | None) -> str:
         """Sign a short-lived OAuth state token.
 
         Args:
-            subdomain: School subdomain or ``None``.
+            school_key: School key or ``None``.
 
         Returns:
             Signed state JWT.
         """
         payload: dict[str, Any] = {
             "sub": str(self._ids.new_id()),
-            "school": subdomain,
+            "school": school_key,
             "exp": int(self._clock.now().timestamp()) + _STATE_TTL_SECONDS,
             "nonce": self._ids.new_id().hex,
         }
@@ -227,11 +227,12 @@ class GoogleOAuthService:
             state: Signed state JWT.
 
         Returns:
-            The school, or ``None`` when the state carried no subdomain.
+            The school, or ``None`` when the state carried no school key.
 
         Raises:
             jwt.InvalidTokenError: On signature/expiry failure.
-            NotFoundError: When the referenced school does not exist.
+            NotFoundError: When the referenced school does not exist or is
+                unavailable.
         """
         payload: dict[str, Any] = jwt.decode(
             state, self._settings.jwt_secret, algorithms=["HS256"], options={"verify_exp": False}
@@ -239,11 +240,11 @@ class GoogleOAuthService:
         expiry = payload.get("exp")
         if not isinstance(expiry, (int, float)) or expiry <= self._clock.now().timestamp():
             raise jwt.ExpiredSignatureError("OAuth state expired.")
-        subdomain = payload.get("school")
-        if not subdomain:
+        school_key = payload.get("school")
+        if not school_key:
             return None
-        school = await self._schools.get_by_subdomain(str(subdomain))
-        if school is None:
+        school = await self._schools.get_by_school_key(str(school_key))
+        if school is None or not school.is_available:
             raise NotFoundError("School not found.")
         return school
 

@@ -53,8 +53,14 @@ from app.repositories.taxonomy import (
 )
 from app.repositories.users import RefreshTokenRepository, UserRepository
 from app.services.admin import AdminService
-from app.services.ai.llm import BatchGeminiClient, GeminiLlmGrader
+from app.services.ai.batching import (
+    BatchGradingClient,
+    GradingProviderBundle,
+    resolve_grading_provider,
+)
+from app.services.ai.llm import LlmGrader
 from app.services.ai.ocr import OcrProvider, build_ocr_registry
+from app.services.ai.registry import build_grading_registry
 from app.services.assessments import AssessmentService
 from app.services.assignments import AssignmentService
 from app.services.audit import AuditService
@@ -85,8 +91,11 @@ class Container:
         engine: Async SQLAlchemy engine.
         sessionmaker: Session factory.
         redis: Redis client (``None`` when unavailable → memory limiter).
-        llm: Direct Gemini grader (``None`` when unconfigured).
-        batch_llm: Batch Gemini adapter (``None`` when unconfigured).
+        llm: Direct grader on the :class:`LlmGrader` port (``None`` when
+            unconfigured).
+        batch_llm: Batch client on the :class:`BatchGradingClient` port
+            (``None`` when unconfigured).
+        grading_registry: Named grading provider bundles.
         ocr_registry: Named OCR providers.
     """
 
@@ -101,8 +110,9 @@ class Container:
     engine: AsyncEngine
     sessionmaker: async_sessionmaker[AsyncSession]
     redis: aioredis.Redis | None = None
-    llm: GeminiLlmGrader | None = field(default=None)
-    batch_llm: BatchGeminiClient | None = field(default=None)
+    llm: LlmGrader | None = field(default=None)
+    batch_llm: BatchGradingClient | None = field(default=None)
+    grading_registry: dict[str, GradingProviderBundle] = field(default_factory=dict)
     ocr_registry: dict[str, OcrProvider] = field(default_factory=dict)
 
     @classmethod
@@ -143,14 +153,10 @@ class Container:
 
         storage = SeaweedS3Storage(settings)
 
-        llm: GeminiLlmGrader | None = None
-        batch_llm: BatchGeminiClient | None = None
-        if settings.gemini_api_key:
-            try:
-                llm = GeminiLlmGrader(settings)
-                batch_llm = BatchGeminiClient(settings)
-            except Exception:  # pragma: no cover - config-dependent
-                logger.exception("Gemini adapter initialization failed; AI grading disabled.")
+        grading_registry = build_grading_registry(settings)
+        bundle = resolve_grading_provider(grading_registry, settings.grading_provider)
+        llm = bundle.llm if bundle else None
+        batch_llm = bundle.batch if bundle else None
 
         http_client = httpx.AsyncClient(timeout=30.0)
         ocr_registry = build_ocr_registry(settings, http_client)
@@ -170,6 +176,7 @@ class Container:
             redis=redis_client,
             llm=llm,
             batch_llm=batch_llm,
+            grading_registry=grading_registry,
             ocr_registry=ocr_registry,
         )
 

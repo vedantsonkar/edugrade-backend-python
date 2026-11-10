@@ -5,6 +5,7 @@ These fakes are substitutable implementations of the core protocols
 """
 
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from uuid import UUID
 
@@ -17,6 +18,14 @@ from app.core.security.tokens import (
     RefreshTokenIssuance,
 )
 from app.core.storage.base import PresignedDownload, PresignedUpload, StoredObjectInfo
+from app.services.ai.batching import (
+    BatchGradeOutcome,
+    BatchGradeRequest,
+    BatchJobHandle,
+    BatchJobSnapshot,
+    BatchJobState,
+)
+from app.services.ai.schema import GradingResult
 
 
 class FakeClock:
@@ -285,14 +294,14 @@ class FakeLlmGrader:
         """Configure the fixed score returned.
 
         Args:
-            score: Score to return for free-text grading.
+            score: Score to return for grading calls.
         """
         self.score = score
         self.calls = 0
 
     async def grade_free_text(
         self, *, question_text: str, student_answer: str, max_points: int
-    ) -> object:
+    ) -> GradingResult:
         """Return a fixed grading result.
 
         Args:
@@ -301,17 +310,136 @@ class FakeLlmGrader:
             max_points: Upper bound of the score.
 
         Returns:
-            Result-like object with score/summary/feedback.
+            Result with the configured score.
         """
-        from app.services.ai.llm import LlmGradeResult
-
+        _ = question_text, student_answer
         self.calls += 1
-        return LlmGradeResult(
+        return GradingResult(
             score=min(self.score, float(max_points)),
             summary="Good attempt.",
             feedback="Well structured; add examples.",
-            plagiarism_score=None,
-            plagiarism_analysis=None,
+        )
+
+    async def grade_submission(
+        self,
+        *,
+        assignment: dict[str, object],
+        attachments: list[dict[str, object]],
+        ocr_texts: list[str],
+    ) -> GradingResult:
+        """Return a fixed full-submission grading result.
+
+        Args:
+            assignment: Unused assignment context.
+            attachments: Unused inline attachments.
+            ocr_texts: Unused OCR texts.
+
+        Returns:
+            Result with the configured score.
+        """
+        _ = assignment, attachments, ocr_texts
+        self.calls += 1
+        return GradingResult(
+            score=self.score,
+            summary="Solid submission.",
+            feedback="Meets the requirements.",
+            plagiarism_score=12.5,
+            plagiarism_analysis="Some overlap with common phrasing.",
+        )
+
+
+class FakeBatchGradingClient:
+    """Scripted :class:`BatchGradingClient` fake.
+
+    Records created jobs and replays canned outcomes on collect.
+    """
+
+    def __init__(self, outcomes: list[BatchGradeOutcome] | None = None) -> None:
+        """Configure the fake.
+
+        Args:
+            outcomes: Outcomes returned by ``collect`` (default: one
+                successful result per created request).
+        """
+        self.outcomes = outcomes
+        self.created_jobs: list[list[BatchGradeRequest]] = []
+        self.job_counter = 0
+        self.disposed: list[tuple[str, str | None]] = []
+        self.state = BatchJobState.SUCCEEDED
+
+    async def create_job(self, requests: Sequence[BatchGradeRequest]) -> BatchJobHandle:
+        """Record the requests and return a synthetic handle.
+
+        Args:
+            requests: One entry per submission.
+
+        Returns:
+            Synthetic handle with a unique job name.
+        """
+        self.created_jobs.append(list(requests))
+        self.job_counter += 1
+        return BatchJobHandle(
+            job_name=f"job-{self.job_counter}", input_ref=f"input-{self.job_counter}"
+        )
+
+    async def poll(self, job_name: str) -> BatchJobSnapshot:
+        """Return the configured snapshot (succeeded by default).
+
+        Args:
+            job_name: Job name from :meth:`create_job`.
+
+        Returns:
+            Snapshot in the configured state with a synthetic output ref.
+        """
+        _ = job_name
+        return BatchJobSnapshot(state=self.state, output_ref="output-1")
+
+    async def collect(self, job_name: str, snapshot: BatchJobSnapshot) -> list[BatchGradeOutcome]:
+        """Return the canned outcomes (defaulting to one per created job).
+
+        Args:
+            job_name: Job name from :meth:`create_job`.
+            snapshot: Snapshot from :meth:`poll`.
+
+        Returns:
+            The configured outcomes, or a success per recorded request.
+        """
+        _ = job_name, snapshot
+        if self.outcomes is not None:
+            return self.outcomes
+        return [
+            BatchGradeOutcome(key=request.key, result=self._result_for(request))
+            for job in self.created_jobs
+            for request in job
+        ]
+
+    async def dispose(
+        self, job_name: str, input_ref: str | None, snapshot: BatchJobSnapshot
+    ) -> None:
+        """Record the cleanup call.
+
+        Args:
+            job_name: Job name from :meth:`create_job`.
+            input_ref: Input reference passed through.
+            snapshot: Terminal snapshot.
+        """
+        _ = snapshot
+        self.disposed.append((job_name, input_ref))
+
+    def _result_for(self, request: BatchGradeRequest) -> GradingResult:
+        """Build a result for one recorded request.
+
+        Args:
+            request: The originating request.
+
+        Returns:
+            Fixed successful result.
+        """
+        _ = request
+        return GradingResult(
+            score=4.0,
+            summary="Excellent work.",
+            feedback="Clear and complete.",
         )
 
 

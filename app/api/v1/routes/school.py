@@ -22,29 +22,30 @@ router = APIRouter(prefix="/school", tags=["school"])
 @router.get(
     "/config/public",
     response_model=SchoolBrandingResponse,
-    summary="Public school branding by subdomain",
+    summary="Public school branding by school key",
+    dependencies=[Depends(rate_limit("30/minute"))],
 )
 async def public_config(
-    subdomain: Annotated[str, Query(min_length=1, max_length=63)],
+    schoolKey: Annotated[str, Query(min_length=1, max_length=63)],
     service: Annotated[SchoolService, Depends(get_school_service)],
 ) -> SchoolBrandingResponse:
     """Fetch a school's public branding for the login page (no auth).
 
     Args:
-        subdomain: School subdomain.
+        schoolKey: Public school key.
         service: School service.
 
     Returns:
         Branding payload.
 
     Raises:
-        NotFoundError: When the subdomain is unknown.
+        NotFoundError: When the key is unknown or the school is unavailable.
     """
-    school = await service.get_public_branding(subdomain)
+    school = await service.get_public_branding(schoolKey)
     return SchoolBrandingResponse(
         id=str(school.id),
         name=school.name,
-        subdomain=school.subdomain,
+        school_key=school.school_key,
         primary_color=school.primary_color,
         logo_url=school.logo_url,
         logo_download_url=await service.public_logo(school),
@@ -64,7 +65,7 @@ async def validate_admin(
     """Validate an onboarding admin key (public, rate-limited).
 
     Args:
-        payload: Key plus optional school id / subdomain.
+        payload: Key plus optional school id / school key.
         service: School service.
 
     Returns:
@@ -73,7 +74,7 @@ async def validate_admin(
     valid, school = await service.validate_admin_key(
         admin_key=payload.admin_key,
         school_id=payload.school_id,
-        subdomain=payload.subdomain,
+        school_key=payload.school_key,
     )
     if not valid or school is None:
         return ValidateAdminResponse(valid=False)
@@ -137,5 +138,5 @@ async def refresh(
         school_name=school.name,
         school_primary_color=school.primary_color,
         school_logo_url=school.logo_url,
-        school_subdomain=school.subdomain,
+        school_key=school.school_key,
     )

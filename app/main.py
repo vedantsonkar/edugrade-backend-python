@@ -88,7 +88,7 @@ def build_app(container: Container) -> FastAPI:
         storage=container.storage,
         ocr=container.ocr_registry.get(container.settings.ocr_provider)
         or next(iter(container.ocr_registry.values())),
-        gemini=container.batch_llm,
+        batch_client=container.batch_llm,
         clock=container.clock,
         ids=container.ids,
     )

@@ -33,7 +33,7 @@ async def test_google_requires_registered_same_school_verified_student(
         student = await session.get(User, UUID(seeded_ids["student"]))
         assert student is not None
         student.auth_method = AuthMethod.BOTH
-        school = School(name="Other School", subdomain="other-school", admin_key="other")
+        school = School(name="Other School", school_key="other-school", admin_key="other")
         session.add(school)
         await session.flush()
         session.add(SchoolConfig(school_id=str(school.id)))

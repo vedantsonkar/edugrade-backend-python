@@ -13,8 +13,10 @@ from app.domain.grading import Submission
 from app.domain.schools import SchoolConfig
 from app.repositories.grading import SubmissionRepository
 from app.repositories.schools import SchoolConfigRepository
-from app.services.ai.llm import LlmGrader, LlmGradeResult
+from app.services.ai.llm import LlmGrader
 from app.services.ai.ocr import OcrProvider, guess_mime
+from app.services.ai.schema import GradingResult
+from app.services.grading.apply import apply_grading_result
 
 logger = logging.getLogger(__name__)
 
@@ -94,11 +96,9 @@ class DirectGradingService:
             if mime.startswith(INLINE_MIME_PREFIXES):
                 import base64
 
-                inline_parts.append(
-                    {"data": base64.b64encode(data).decode(), "mime_type": mime}
-                )
+                inline_parts.append({"data": base64.b64encode(data).decode(), "mime_type": mime})
 
-        result: LlmGradeResult = await self._llm.grade_submission(
+        result: GradingResult = await self._llm.grade_submission(
             assignment={
                 "subject": assignment.subject,
                 "title": assignment.title,
@@ -118,36 +118,14 @@ class DirectGradingService:
         await self._submissions.session.flush()
         return submission
 
-    def _apply(self, submission: Submission, result: LlmGradeResult) -> None:
+    def _apply(self, submission: Submission, result: GradingResult) -> None:
         """Write grading results onto the submission.
 
-        Letter-scale assignments convert the model's 0-4 anchor into a
-        letter grade; numeric assignments store the score directly.
+        Delegates to the shared applier so the direct and batch paths stay
+        identical (grading-type handling lives in one place).
 
         Args:
             submission: Submission to update (mutated).
             result: Model output.
         """
-        submission.ai_summary = result.summary
-        submission.ai_feedback = result.feedback
-        submission.plagiarism_score = result.plagiarism_score
-        submission.plagiarism_analysis = result.plagiarism_analysis
-        if submission.assignment.grading_type.value == "ALPHABET":
-            submission.ai_grade_letter = self._letter_for(result.score)
-            submission.grade = None
-            return
-        submission.grade = result.score
-
-    @staticmethod
-    def _letter_for(score: float) -> str:
-        """Map a 0-4 anchor score back onto its letter grade.
-
-        Args:
-            score: Model-provided anchor.
-
-        Returns:
-            Letter grade (``F`` for unrecognized anchors).
-        """
-        anchors = {4.0: "A", 3.0: "B", 2.0: "C", 1.0: "D", 0.5: "E", 0.0: "F"}
-        nearest = min(anchors, key=lambda a: abs(a - score))
-        return anchors[nearest]
+        apply_grading_result(submission, result)

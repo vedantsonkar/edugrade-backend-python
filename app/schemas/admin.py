@@ -297,7 +297,8 @@ class BulkUserRowResult(BaseSchema):
     """Outcome for one CSV row.
 
     Attributes:
-        row: 1-based CSV row number (excluding header).
+        row: Physical CSV line number (header is line 1, so the first data
+            row is line 2).
         email: Parsed email.
         status: ``created`` / ``updated`` / ``skipped`` / ``error``.
         message: Human-readable detail.
@@ -413,6 +414,8 @@ class AuditLogResponse(BaseSchema):
     Attributes:
         id: Log id.
         user_id: Acting user, when known.
+        user_name / user_email: Acting user's display name and email,
+            resolved server-side for display (no FK survives user deletion).
         school_id: Tenant.
         action: Event name.
         resource: Affected resource, when applicable.
@@ -423,6 +426,8 @@ class AuditLogResponse(BaseSchema):
 
     id: IdStr
     user_id: IdStr | None = None
+    user_name: str | None = None
+    user_email: str | None = None
     school_id: IdStr
     action: str
     resource: IdStr | None = None

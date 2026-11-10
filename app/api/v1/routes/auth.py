@@ -110,7 +110,7 @@ def _to_login_response(
             name=result.school.name,
             primary_color=result.school.primary_color,
             logo_url=result.school.logo_url,
-            subdomain=result.school.subdomain,
+            school_key=result.school.school_key,
         ),
         enable_logging=result.enable_logging,
         tokens=TokenPair(
@@ -260,7 +260,7 @@ async def me(
         school_name=school.name if school else None,
         school_primary_color=school.primary_color if school else None,
         school_logo_url=school.logo_url if school else None,
-        school_subdomain=school.subdomain if school else None,
+        school_key=school.school_key if school else None,
         enable_logging=bool(config.enable_logging) if config else False,
     )
 
@@ -275,15 +275,15 @@ async def google_start(
 
     Args:
         request: Incoming request (optional ``school`` query param carries
-            the login page's subdomain into the signed state).
+            the login page's school key into the signed state).
         oauth: OAuth service.
         container: Cookie configuration.
 
     Returns:
         Redirect response.
     """
-    subdomain = request.query_params.get("school")
-    url = oauth.authorization_url(subdomain)
+    school_key = request.query_params.get("school")
+    url = oauth.authorization_url(school_key)
     from urllib.parse import parse_qs, urlparse
 
     state = parse_qs(urlparse(url).query)["state"][0]

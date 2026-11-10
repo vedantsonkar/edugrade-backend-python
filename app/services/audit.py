@@ -63,6 +63,39 @@ class AuditService:
             )
         return len(events)
 
+    async def record_event(
+        self,
+        *,
+        school_id: str | None,
+        principal: UserPrincipal | None,
+        request: Request | None,
+        action: str,
+        resource: str | None = None,
+        details: dict[str, object] | None = None,
+    ) -> None:
+        """Persist a single server-side audit event attributed to the caller.
+
+        Convenience wrapper over :meth:`record` for route handlers that emit
+        one event per successful mutation; commits with the request-scoped
+        transaction so events never outlive their change.
+
+        Args:
+            school_id: Tenant from the principal.
+            principal: Authenticated caller.
+            request: Request providing IP/user-agent provenance.
+            action: Machine-readable event name (``UPPERCASE_SNAKE``).
+            resource: Affected resource identifier, when applicable.
+            details: Structured payload.
+        """
+        await self.record(
+            school_id=school_id,
+            principal=principal,
+            request=request,
+            events=[
+                AuditEventInput(action=action, resource=resource, details=details)
+            ],
+        )
+
     async def list_events(
         self,
         school_id: str,

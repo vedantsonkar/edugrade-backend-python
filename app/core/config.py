@@ -57,8 +57,16 @@ class Settings(BaseSettings):
     )
 
     # ── AI grading ───────────────────────────────────────────────────────
+    grading_provider: str = Field(default="gemini")
+    """Which registered grading provider to use (``gemini`` | ``openai``)."""
+    grading_temperature: float = Field(default=0.0, ge=0, le=2)
+    """Sampling temperature for AI grading (0 = deterministic regrades)."""
+    grading_seed: int | None = Field(default=None)
+    """Optional sampling seed (best-effort reproducibility; OpenAI only)."""
     gemini_api_key: str | None = Field(default=None)
     grading_model: str = Field(default="gemini-2.5-flash-lite")
+    openai_api_key: str | None = Field(default=None)
+    openai_model: str = Field(default="gpt-4o-mini")
     ocr_provider: str = Field(default="glm")
     glm_ocr_api_key: str | None = Field(default=None)
     glm_ocr_endpoint: str = Field(
@@ -139,6 +147,7 @@ def describe_settings(settings: Settings) -> dict[str, object]:
         "jwt_secret",
         "google_client_secret",
         "gemini_api_key",
+        "openai_api_key",
         "glm_ocr_api_key",
         "seaweed_s3_secret_access_key",
         "cron_secret",

@@ -66,14 +66,14 @@ class AuthSchoolResponse(BaseSchema):
         name: Display name.
         primary_color: Brand hex color.
         logo_url: Logo storage key, if any.
-        subdomain: URL subdomain.
+        school_key: Public school key.
     """
 
     id: IdStr
     name: str
     primary_color: str
     logo_url: str | None = None
-    subdomain: str
+    school_key: str
 
 
 class LoginResponse(BaseSchema):
@@ -114,7 +114,7 @@ class MeResponse(BaseSchema):
         school_name: School display name.
         school_primary_color: Brand color.
         school_logo_url: Logo storage key.
-        school_subdomain: School subdomain.
+        school_key: Public school key.
         enable_logging: Client analytics flag for the school.
     """
 
@@ -127,5 +127,5 @@ class MeResponse(BaseSchema):
     school_name: str | None = None
     school_primary_color: str | None = None
     school_logo_url: str | None = None
-    school_subdomain: str | None = None
+    school_key: str | None = None
     enable_logging: bool = False
