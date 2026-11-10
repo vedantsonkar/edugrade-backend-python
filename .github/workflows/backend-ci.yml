@@ -25,7 +25,7 @@ jobs:
       - name: Type check
         run: mypy app
       - name: Test
-        run: pytest
+        run: python -m pytest
       - name: Validate deployment scripts
         run: |
           bash -n deploy/uat/deploy.sh
