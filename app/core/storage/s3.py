@@ -46,8 +46,10 @@ class SeaweedS3Storage:
             self._client = boto3.client(
                 "s3",
                 region_name=settings.seaweed_s3_region,
+                endpoint_url=f"https://s3.{settings.seaweed_s3_region}.amazonaws.com",
                 config=Config(
                     signature_version="s3v4",
+                    s3={"addressing_style": "virtual"},
                     connect_timeout=3,
                     read_timeout=5,
                     retries={"max_attempts": 1},
